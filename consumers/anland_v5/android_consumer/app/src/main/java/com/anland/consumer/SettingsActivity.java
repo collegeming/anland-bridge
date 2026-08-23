@@ -738,15 +738,22 @@ public class SettingsActivity extends Activity {
         bridgeSwitch.setOnCheckedChangeListener((v, checked) -> {
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putBoolean(KEY_BRIDGE_SERVICE_ENABLED, checked).apply();
-            // The bridge service is owned by the anland process; toggling here
-            // only persists intent. The service reads this pref on next boot and
-            // (when implemented) calls Native bridge start/stop accordingly.
+            BridgeService.setEnabled(this, checked);
             String msg = checked
                 ? getString(R.string.bridge_service_enabled_toast)
                 : getString(R.string.bridge_service_disabled_toast);
             Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
         });
         root.addView(bridgeSwitch);
+
+        TextView token = new TextView(this);
+        token.setText(getString(R.string.bridge_service_token,
+                BridgeService.getOrCreateToken(this)));
+        token.setTextSize(12);
+        token.setTextColor(Color.DKGRAY);
+        token.setTextIsSelectable(true);
+        token.setPadding(0, dp(8), 0, 0);
+        root.addView(token);
 
         TextView bridgeHint = new TextView(this);
         bridgeHint.setText(R.string.bridge_service_hint);

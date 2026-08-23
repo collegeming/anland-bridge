@@ -6,8 +6,8 @@ import android.view.Surface;
  * JNI transport surface for the display consumer. All native methods bind by name to
  * {@code Java_com_anland_consumer_Native_*} in {@code jni/native_consumer.c}.
  *
- * The shared library is loaded by {@link MainActivity}'s static initializer (a
- * single {@code .so} backs this class, MainActivity and CameraServices).
+ * This class loads the shared library directly so foreground-service sessions do not
+ * depend on {@link MainActivity} class initialization.
  *
  * Instance-based: each consumer window owns its own {@code Native} (a native
  * consumer_state handle behind {@link #handle}), so multiple independent pipelines
@@ -16,6 +16,10 @@ import android.view.Surface;
  * window is torn down.
  */
 public final class Native {
+    static {
+        System.loadLibrary("anland_consumer");
+    }
+
     private long handle;
 
     public Native() {
@@ -44,6 +48,12 @@ public final class Native {
                         topAppEnable, topAppPath, topAppMode, topAppStops);
     }
     public void start(Surface surface, Object clipboardTarget, Object activityTarget) { nativeStart(handle, surface, clipboardTarget, activityTarget); }
+    public void startRemote(Surface surface, Object clipboardTarget,
+                            int displayWidth, int displayHeight,
+                            int encodedWidth, int encodedHeight, int fps) {
+        nativeStartRemote(handle, surface, clipboardTarget, displayWidth, displayHeight,
+                encodedWidth, encodedHeight, fps);
+    }
     public void stop() { nativeStop(handle); }
     /** Mark this instance focused: its camera client receives real frames, others blank. */
     public void setFocused(boolean focused) { nativeSetFocused(handle, focused); }
@@ -80,6 +90,10 @@ public final class Native {
     // display lib drops the connection (see on_fallback in native_consumer.c).
     private static native void nativeStart(long handle, Surface surface, Object clipboardTarget,
                                            Object activityTarget);
+    private static native void nativeStartRemote(long handle, Surface surface,
+                                                 Object clipboardTarget,
+                                                 int displayWidth, int displayHeight,
+                                                 int encodedWidth, int encodedHeight, int fps);
     private static native void nativeStop(long handle);
     private static native void nativeSetCustomResolution(long handle, int width, int height);
     private static native void nativeSendTouch(long handle, int action, float x, float y, int pointerId);

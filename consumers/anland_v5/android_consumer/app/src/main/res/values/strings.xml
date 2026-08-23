@@ -192,7 +192,12 @@
     <!-- Bridge Service (RDP screen-cast bridge) -->
     <string name="section_bridge_service">Bridge Service (RDP Cast)</string>
     <string name="bridge_service_switch">Enable bridge service</string>
-    <string name="bridge_service_hint">Bridges this app\'s hardware-encoded video and the anland input/clipboard path to an RDP server so a PC can connect with the built-in mstsc client (no custom PC app). Requires the companion project lamco-anland-bridge (https://github.com/collegeming/lamco-anland-bridge) running in the container. Takes effect on next app start.</string>
-    <string name="bridge_service_enabled_toast">Bridge service will start on next app launch. Make sure lamco-anland-bridge is running in the container.</string>
+    <string name="bridge_service_hint">Streams only the anland desktop through Android hardware H.264 encoding and forwards RDP input and clipboard data. The companion lamco-anland-bridge server must connect to tcp://127.0.0.1:33910.</string>
+    <string name="bridge_service_enabled_toast">Bridge service started. Start lamco-anland-bridge in the container.</string>
     <string name="bridge_service_disabled_toast">Bridge service disabled.</string>
+    <string name="bridge_service_token">Bridge token: %1$s</string>
+    <string name="bridge_notification_channel">Anland RDP bridge</string>
+    <string name="bridge_notification_title">Anland RDP bridge</string>
+    <string name="bridge_notification_waiting">Waiting for the local RDP server</string>
+    <string name="bridge_notification_connected">Hardware-encoding the anland desktop</string>
 </resources>

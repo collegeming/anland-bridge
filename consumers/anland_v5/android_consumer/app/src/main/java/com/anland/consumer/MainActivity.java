@@ -18,6 +18,7 @@ import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Looper;
 import android.util.Log;
 import android.util.SparseArray;
 import android.view.Display;
@@ -38,6 +39,8 @@ import android.widget.FrameLayout;
 import android.util.DisplayMetrics;   // ADDED
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 
 public class MainActivity extends Activity
@@ -125,6 +128,48 @@ public class MainActivity extends Activity
     private String mAppliedLayoutJson = "";
 
     public static MainActivity sInstance;
+    private static volatile boolean sRemoteBridgeActive;
+    private boolean mResumed;
+
+    static void setRemoteBridgeActiveSync(boolean active) {
+        sRemoteBridgeActive = active;
+        MainActivity activity = sInstance;
+        if (activity == null) return;
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            activity.onRemoteBridgeStateChanged(active);
+            return;
+        }
+
+        CountDownLatch applied = new CountDownLatch(1);
+        activity.runOnUiThread(() -> {
+            try {
+                activity.onRemoteBridgeStateChanged(active);
+            } finally {
+                applied.countDown();
+            }
+        });
+        try {
+            if (!applied.await(5, TimeUnit.SECONDS)) {
+                Log.w(TAG, "Timed out switching anland consumer for RDP bridge");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void onRemoteBridgeStateChanged(boolean active) {
+        if (mNative == null) return;
+        if (active) {
+            mNative.stop();
+        } else if (mResumed && surfaceReady) {
+            applyConnectionConfig();
+            startNative(surfaceView.getHolder().getSurface());
+            pushRefreshRate();
+            applyMicState();
+            applyAudioLatency();
+            applyAudioKeepalive();
+        }
+    }
 
     // ADDED: VirtualKeyboardView instance
     private VirtualKeyboardView virtualKeyboardView;
@@ -419,6 +464,10 @@ public class MainActivity extends Activity
 
         setupMediaAudio();
         applyOrientation();
+        if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(BridgeService.KEY_ENABLED, false)) {
+            BridgeService.setEnabled(this, true);
+        }
 
         // Apply the launch parameters: socket path (overrides the saved pref) and
         // window name (task title). Read them before anything else so the dedup
@@ -1447,6 +1496,7 @@ public class MainActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        mResumed = true;
 
         // Bounced to Settings from onCreate (socket missing): nothing was set up, so
         // just exit this window instead of running the connect logic.
@@ -1505,7 +1555,7 @@ public class MainActivity extends Activity
         // and registers SERVICE_TYPE_CAMERA on the very first connect rather than a
         // later reconnect. Idempotent, so safe to call on every resume.
         applyCameraState();
-        if (surfaceReady) {
+        if (surfaceReady && !sRemoteBridgeActive) {
             mNative.stop();
             applyConnectionConfig();
             startNative(surfaceView.getHolder().getSurface());
@@ -1535,6 +1585,7 @@ public class MainActivity extends Activity
     @Override
     protected void onPause() {
         super.onPause();
+        mResumed = false;
         // Socket-missing bounce: no pipeline exists, so skip teardown (mNative is
         // null) and don't let the jump to Settings trigger any of it.
         if (mForceSettings) return;
@@ -1671,13 +1722,15 @@ public class MainActivity extends Activity
         surfaceReady = true;
         // Same ordering guarantee as onResume: camera service settled before connect.
         applyCameraState();
-        mNative.stop();
-        applyConnectionConfig();
-        startNative(holder.getSurface());
-        pushRefreshRate();
-        applyMicState();
-        applyAudioLatency();
-        applyAudioKeepalive();
+        if (!sRemoteBridgeActive) {
+            mNative.stop();
+            applyConnectionConfig();
+            startNative(holder.getSurface());
+            pushRefreshRate();
+            applyMicState();
+            applyAudioLatency();
+            applyAudioKeepalive();
+        }
 
         // ===== 更新屏幕尺寸并重置平滑状态 =====
         updateTouchpadBounds(null);
