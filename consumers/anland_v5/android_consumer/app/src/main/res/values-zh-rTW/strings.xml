@@ -165,7 +165,12 @@
     <!-- 投屏橋接服務（RDP） -->
     <string name="section_bridge_service">投屏橋接服務（RDP）</string>
     <string name="bridge_service_switch">啟用橋接服務</string>
-    <string name="bridge_service_hint">將本應用的硬體編碼視訊流與 anland 輸入/剪貼簿通道橋接給 RDP 伺服器，使電腦端可用內建的 mstsc 遠端桌面直接連線（無需額外 PC 用戶端）。需要容器側執行配套專案 lamco-anland-bridge（https://github.com/collegeming/lamco-anland-bridge）配合使用。下次啟動應用時生效。</string>
-    <string name="bridge_service_enabled_toast">橋接服務將在下次啟動應用時開啟，請確保容器內已執行 lamco-anland-bridge。</string>
+    <string name="bridge_service_hint">僅透過 Android 硬體 H.264 編碼傳輸 anland 桌面，並轉送 RDP 輸入與剪貼簿。容器側 lamco-anland-bridge 需連線 tcp://127.0.0.1:33910。</string>
+    <string name="bridge_service_enabled_toast">橋接服務已啟動，請在容器內執行 lamco-anland-bridge。</string>
     <string name="bridge_service_disabled_toast">已關閉橋接服務。</string>
+    <string name="bridge_service_token">橋接權杖：%1$s</string>
+    <string name="bridge_notification_channel">Anland RDP 橋接</string>
+    <string name="bridge_notification_title">Anland RDP 橋接</string>
+    <string name="bridge_notification_waiting">正在等待本機 RDP 伺服器</string>
+    <string name="bridge_notification_connected">正在硬體編碼 anland 桌面</string>
 </resources>

@@ -14,6 +14,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "anw_hidden.h"
@@ -61,6 +62,12 @@ struct consumer_state {
 
     int screen_w;
     int screen_h;
+    bool remote_mode;
+    int remote_display_w;
+    int remote_display_h;
+    int remote_encoded_w;
+    int remote_encoded_h;
+    int remote_fps;
 
     // Latest display refresh rate (milli-Hz) reported from Java. Read on
     // (re)connect to seed the producer; updated live by nativeSetRefreshRate.
@@ -224,6 +231,7 @@ static void *event_thread_func(void *arg)
     /* Find classes/methods once */
     jclass ctxClass = (*env)->GetObjectClass(env, s->clipboard_obj);
     jmethodID setClipMethod = (*env)->GetMethodID(env, ctxClass, "nativeSetClipboardText", "(Ljava/lang/String;)V");
+    (*env)->DeleteLocalRef(env, ctxClass);
     if (!setClipMethod) {
         LOGE("event thread: nativeSetClipboardText not found");
         (*g_jvm)->DetachCurrentThread(g_jvm);
@@ -258,20 +266,43 @@ static void *event_thread_func(void *arg)
              * matches the type against the registered services and sends the
              * pre-created fds back over SCM_RIGHTS. */
             handle_resource_request(s->ctx, &ev);
-        } else if (ev.type == OUTPUT_TYPE_CLIPBOARD && ev.clipboard.size > 0) {
-            char *buf = malloc(ev.clipboard.size + 1);
-            if (!buf)
+        } else if (ev.type == OUTPUT_TYPE_CLIPBOARD) {
+            uint32_t size = ev.clipboard.size;
+            jbyteArray bytes = (*env)->NewByteArray(env, (jsize)size);
+            if (!bytes)
                 continue;
 
-            if (poll_output_event_extend_data(s->ctx, buf, ev.clipboard.size, 5000) == 1) {
-                buf[ev.clipboard.size] = '\0';
-                jstring jstr = (*env)->NewStringUTF(env, buf);
+            bool received = true;
+            if (size > 0) {
+                char *buf = malloc(size);
+                if (!buf) {
+                    (*env)->DeleteLocalRef(env, bytes);
+                    continue;
+                }
+                received = poll_output_event_extend_data(s->ctx, buf, size, 5000) == 1;
+                if (received)
+                    (*env)->SetByteArrayRegion(env, bytes, 0, (jsize)size, (jbyte *)buf);
+                free(buf);
+            }
+
+            if (received) {
+                jclass stringClass = (*env)->FindClass(env, "java/lang/String");
+                jmethodID ctor = (*env)->GetMethodID(env, stringClass, "<init>",
+                                                     "([BLjava/nio/charset/Charset;)V");
+                jclass charsetClass = (*env)->FindClass(env, "java/nio/charset/StandardCharsets");
+                jfieldID utf8Field = (*env)->GetStaticFieldID(
+                    env, charsetClass, "UTF_8", "Ljava/nio/charset/Charset;");
+                jobject utf8 = (*env)->GetStaticObjectField(env, charsetClass, utf8Field);
+                jstring jstr = (jstring)(*env)->NewObject(env, stringClass, ctor, bytes, utf8);
                 if (jstr) {
                     (*env)->CallVoidMethod(env, s->clipboard_obj, setClipMethod, jstr);
                     (*env)->DeleteLocalRef(env, jstr);
                 }
+                (*env)->DeleteLocalRef(env, utf8);
+                (*env)->DeleteLocalRef(env, charsetClass);
+                (*env)->DeleteLocalRef(env, stringClass);
             }
-            free(buf);
+            (*env)->DeleteLocalRef(env, bytes);
         } else if (ev.type == OUTPUT_TYPE_SET_CONSUMER_VAR) {
             /* Producer asserts a transient runtime override. CONSUMER_VAR_CAPTURE_MOUSE
              * forces pointer capture on for Wayland pointer lock (games); 0 releases.
@@ -442,19 +473,23 @@ static int do_connect(struct consumer_state *s)
     int ch = s->cfg_custom_height;
     pthread_mutex_unlock(&s->cfg_lock);
 
-    if (cw > 0 && ch > 0) {
+    if (s->remote_mode) {
+        s->screen_w = s->remote_encoded_w;
+        s->screen_h = s->remote_encoded_h;
+    } else if (cw > 0 && ch > 0) {
         s->screen_w = cw;
         s->screen_h = ch;
     } else {
-       s->screen_w = ANativeWindow_getWidth(win);
-       s->screen_h = ANativeWindow_getHeight(win);
+        s->screen_w = ANativeWindow_getWidth(win);
+        s->screen_h = ANativeWindow_getHeight(win);
     }
 
     /* dequeueBuffer needs the window connected to an API first (ANativeWindow_lock
      * did this internally). Disconnect first so reconnect is idempotent. */
-    anw_api_disconnect(win, ANW_API_CPU);
-    if (anw_api_connect(win, ANW_API_CPU) != 0) {
-        LOGE("api_connect(CPU) failed");
+    int window_api = s->remote_mode ? ANW_API_EGL : ANW_API_CPU;
+    anw_api_disconnect(win, window_api);
+    if (anw_api_connect(win, window_api) != 0) {
+        LOGE("api_connect(%s) failed", s->remote_mode ? "EGL" : "CPU");
         return -1;
     }
 
@@ -491,7 +526,9 @@ static int do_connect(struct consumer_state *s)
         return -1;
     }
 
-    set_screen_info(s->ctx, s->screen_w, s->screen_h,
+    int display_w = s->remote_mode ? s->remote_display_w : s->screen_w;
+    int display_h = s->remote_mode ? s->remote_display_h : s->screen_h;
+    set_screen_info(s->ctx, display_w, display_h,
                     PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
     push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
 
@@ -661,6 +698,12 @@ static void *render_thread_func(void *arg)
         TracyCZoneN(zRefresh, "refresh_done (producer render)", 1);
         int rfence = refresh_done(s->ctx);
         TracyCZoneEnd(zRefresh);
+        if (s->remote_mode) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t timestamp_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+            api.setBuffersTimestamp(s->window, timestamp_ns);
+        }
         api.queueBuffer(s->window, anb, rfence);
         TracyCFrameMark;
     }
@@ -807,10 +850,10 @@ Java_com_anland_consumer_Native_nativeSetCustomResolution(
     LOGI("custom resolution: %dx%d", width, height);
 }
 
-JNIEXPORT void JNICALL
-Java_com_anland_consumer_Native_nativeStart(
-    JNIEnv *env, jclass clazz, jlong handle, jobject surface, jobject clipboardTarget,
-    jobject activityTarget)
+static void start_consumer(
+    JNIEnv *env, jlong handle, jobject surface, jobject clipboardTarget,
+    jobject activityTarget, bool remote_mode, int display_width, int display_height,
+    int encoded_width, int encoded_height, int fps)
 {
     struct consumer_state *s = STATE(handle);
     if (!s)
@@ -852,33 +895,54 @@ Java_com_anland_consumer_Native_nativeStart(
         return;
     }
 
-    /* Save JVM (process-global) and this instance's clipboard callback target. */
-    if (!g_jvm) {
+    s->remote_mode = remote_mode;
+    s->remote_display_w = display_width;
+    s->remote_display_h = display_height;
+    s->remote_encoded_w = encoded_width;
+    s->remote_encoded_h = encoded_height;
+    s->remote_fps = fps;
+    if (remote_mode)
+        s->refresh_mhz = (uint32_t)fps * 1000;
+
+    if (!g_jvm)
         (*env)->GetJavaVM(env, &g_jvm);
-    }
-    if (s->clipboard_obj) {
+    if (s->clipboard_obj)
         (*env)->DeleteGlobalRef(env, s->clipboard_obj);
-    }
-    /* Static natives have no `thiz`; the Java layer passes the object whose
-     * nativeSetClipboardText / nativeClipListening / nativeClipboardSync the
-     * event thread calls back into (the Clipboard instance). */
     s->clipboard_obj = (*env)->NewGlobalRef(env, clipboardTarget);
 
-    /* Owning MainActivity for the fallback callback (see on_fallback). */
-    if (s->activity_obj) {
+    if (s->activity_obj)
         (*env)->DeleteGlobalRef(env, s->activity_obj);
-    }
     s->activity_obj = activityTarget ? (*env)->NewGlobalRef(env, activityTarget) : NULL;
 
     s->running = true;
     s->need_reconnect = true;
     pthread_create(&s->render_thread, NULL, render_thread_func, s);
 
-    /* Audio streams live independently of the connection; the render thread attaches
-     * the fd via audio_set_ctx() once connected. */
-    audio_start(s->audio);
+    if (!remote_mode)
+        audio_start(s->audio);
 
     pthread_mutex_unlock(&s->lock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeStart(
+    JNIEnv *env, jclass clazz, jlong handle, jobject surface, jobject clipboardTarget,
+    jobject activityTarget)
+{
+    (void)clazz;
+    start_consumer(env, handle, surface, clipboardTarget, activityTarget,
+                   false, 0, 0, 0, 0, 0);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeStartRemote(
+    JNIEnv *env, jclass clazz, jlong handle, jobject surface, jobject clipboardTarget,
+    jint display_width, jint display_height, jint encoded_width, jint encoded_height,
+    jint fps)
+{
+    (void)clazz;
+    start_consumer(env, handle, surface, clipboardTarget, NULL,
+                   true, display_width, display_height, encoded_width, encoded_height, fps);
 }
 
 JNIEXPORT void JNICALL
@@ -1051,19 +1115,19 @@ Java_com_anland_consumer_Native_nativeSendClipboard(
         return;
 
     jsize len = (*env)->GetArrayLength(env, data);
-    if (len <= 0)
-        return;
-
-    char *buf = malloc(len);
-    if (!buf)
-        return;
-    (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)buf);
+    char *buf = NULL;
+    if (len > 0) {
+        buf = malloc(len);
+        if (!buf)
+            return;
+        (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)buf);
+    }
 
     struct InputEvent ev = {
         .type = INPUT_TYPE_CLIPBOARD,
         .clipboard = { .size = (uint32_t)len },
     };
-    push_input_event_with_length(s->ctx, &ev, buf, len);
+    push_input_event_with_length(s->ctx, &ev, buf, (size_t)len);
     free(buf);
 }
 

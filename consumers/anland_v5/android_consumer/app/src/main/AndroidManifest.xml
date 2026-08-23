@@ -9,6 +9,9 @@
     <!-- Capture the device camera(s) to forward to the Linux producer (Camera2 NDK). -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- Bring an already-open window's task to the front instead of opening a
          duplicate when a launch targets a socket that is already on screen. -->
     <uses-permission android:name="android.permission.REORDER_TASKS" />
@@ -19,6 +22,16 @@
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+        <service
+            android:name=".BridgeService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Hardware-encoded anland desktop streaming to a local RDP bridge" />
+        </service>
 
         <!-- AccessibilityService: intercept hardware keys (Fn combos, etc.) -->
         <service

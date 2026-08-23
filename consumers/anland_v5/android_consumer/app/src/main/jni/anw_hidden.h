@@ -57,6 +57,7 @@ typedef struct ANativeWindowBuffer {
 enum {
     ANW_API_CONNECT    = 13,
     ANW_API_DISCONNECT = 14,
+    ANW_API_EGL        = 1,
     ANW_API_CPU        = 2,
 };
 
@@ -102,6 +103,7 @@ typedef int (*pfn_ANativeWindow_query)(const ANativeWindow *, int, int *);
 typedef int (*pfn_ANativeWindow_dequeueBuffer)(ANativeWindow *, ANativeWindowBuffer **, int *fenceFd);
 typedef int (*pfn_ANativeWindow_queueBuffer)(ANativeWindow *, ANativeWindowBuffer *, int fenceFd);
 typedef int (*pfn_ANativeWindow_cancelBuffer)(ANativeWindow *, ANativeWindowBuffer *, int fenceFd);
+typedef int (*pfn_ANativeWindow_setBuffersTimestamp)(ANativeWindow *, int64_t timestamp);
 
 struct anw_api {
     pfn_ANativeWindow_setBufferCount setBufferCount;
@@ -109,6 +111,7 @@ struct anw_api {
     pfn_ANativeWindow_dequeueBuffer  dequeueBuffer;
     pfn_ANativeWindow_queueBuffer    queueBuffer;
     pfn_ANativeWindow_cancelBuffer   cancelBuffer;
+    pfn_ANativeWindow_setBuffersTimestamp setBuffersTimestamp;
 };
 
 static inline int anw_api_load(struct anw_api *api)
@@ -122,9 +125,12 @@ static inline int anw_api_load(struct anw_api *api)
     api->dequeueBuffer  = (pfn_ANativeWindow_dequeueBuffer)  dlsym(lib, "ANativeWindow_dequeueBuffer");
     api->queueBuffer    = (pfn_ANativeWindow_queueBuffer)    dlsym(lib, "ANativeWindow_queueBuffer");
     api->cancelBuffer   = (pfn_ANativeWindow_cancelBuffer)   dlsym(lib, "ANativeWindow_cancelBuffer");
+    api->setBuffersTimestamp = (pfn_ANativeWindow_setBuffersTimestamp)
+        dlsym(lib, "ANativeWindow_setBuffersTimestamp");
 
     if (!api->setBufferCount || !api->query ||
-        !api->dequeueBuffer || !api->queueBuffer || !api->cancelBuffer)
+        !api->dequeueBuffer || !api->queueBuffer || !api->cancelBuffer ||
+        !api->setBuffersTimestamp)
         return -1;
 
     return 0;
