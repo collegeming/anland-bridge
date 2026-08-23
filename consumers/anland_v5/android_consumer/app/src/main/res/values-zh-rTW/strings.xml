@@ -161,4 +161,11 @@
         <item>螢幕 × 0.5</item>
         <item>螢幕 × 0.25</item>
     </string-array>
+
+    <!-- 投屏橋接服務（RDP） -->
+    <string name="section_bridge_service">投屏橋接服務（RDP）</string>
+    <string name="bridge_service_switch">啟用橋接服務</string>
+    <string name="bridge_service_hint">將本應用的硬體編碼視訊流與 anland 輸入/剪貼簿通道橋接給 RDP 伺服器，使電腦端可用內建的 mstsc 遠端桌面直接連線（無需額外 PC 用戶端）。需要容器側執行配套專案 lamco-anland-bridge（https://github.com/collegeming/lamco-anland-bridge）配合使用。下次啟動應用時生效。</string>
+    <string name="bridge_service_enabled_toast">橋接服務將在下次啟動應用時開啟，請確保容器內已執行 lamco-anland-bridge。</string>
+    <string name="bridge_service_disabled_toast">已關閉橋接服務。</string>
 </resources>

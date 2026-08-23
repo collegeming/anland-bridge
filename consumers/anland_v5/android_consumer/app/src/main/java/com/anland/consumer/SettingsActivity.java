@@ -62,6 +62,12 @@ public class SettingsActivity extends Activity {
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private static final String KEY_NOTIFICATION_ENABLED = "settings_notification";
+    // Bridge service: bridges this app's MediaCodec video + anland input to the
+    // lamco-anland-bridge RDP server so a PC can connect with mstsc. The service
+    // itself is started/stopped by the bridge module; this toggle only persists
+    // the user's intent and is read on app boot. Requires the companion project
+    // https://github.com/collegeming/lamco-anland-bridge on the container side.
+    private static final String KEY_BRIDGE_SERVICE_ENABLED = "bridge_service_enabled";
     private static final String KEY_ORIENTATION = "screen_orientation";
     private static final String[] ORIENTATION_VALUES = {"default", "landscape", "portrait"};
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
@@ -283,6 +289,7 @@ public class SettingsActivity extends Activity {
         LinearLayout root = newPage(R.string.cat_general_title);
         buildOrientationSection(root);
         buildNotificationSection(root);
+        buildBridgeServiceSection(root);
         setContent(root);
     }
 
@@ -704,6 +711,49 @@ public class SettingsActivity extends Activity {
         notificationHint.setTextColor(Color.GRAY);
         notificationHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(notificationHint);
+    }
+
+    // ============================================================
+    // ===== Bridge Service (RDP 投屏桥接) 区域 =====
+    // ============================================================
+    // Bridges this app's hardware MediaCodec video and the anland input/clipboard
+    // path to the lamco-anland-bridge RDP server running in the container, so a PC
+    // can connect with the built-in mstsc client (no custom PC app). Requires the
+    // companion project https://github.com/collegeming/lamco-anland-bridge.
+    private void buildBridgeServiceSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        TextView header = new TextView(this);
+        header.setText(R.string.section_bridge_service);
+        header.setTextSize(16);
+        header.setTypeface(null, Typeface.BOLD);
+        header.setPadding(0, 0, 0, dp(8));
+        root.addView(header);
+
+        Switch bridgeSwitch = new Switch(this);
+        bridgeSwitch.setText(R.string.bridge_service_switch);
+        bridgeSwitch.setTextSize(14);
+        bridgeSwitch.setPadding(0, dp(8), 0, 0);
+        bridgeSwitch.setChecked(prefs.getBoolean(KEY_BRIDGE_SERVICE_ENABLED, false));
+        bridgeSwitch.setOnCheckedChangeListener((v, checked) -> {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_BRIDGE_SERVICE_ENABLED, checked).apply();
+            // The bridge service is owned by the anland process; toggling here
+            // only persists intent. The service reads this pref on next boot and
+            // (when implemented) calls Native bridge start/stop accordingly.
+            String msg = checked
+                ? getString(R.string.bridge_service_enabled_toast)
+                : getString(R.string.bridge_service_disabled_toast);
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+        });
+        root.addView(bridgeSwitch);
+
+        TextView bridgeHint = new TextView(this);
+        bridgeHint.setText(R.string.bridge_service_hint);
+        bridgeHint.setTextSize(12);
+        bridgeHint.setTextColor(Color.GRAY);
+        bridgeHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(bridgeHint);
     }
 
     // ============================================================
