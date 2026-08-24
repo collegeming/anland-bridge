@@ -3,6 +3,7 @@
 #include "../common/socket_utils.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -12,7 +13,12 @@
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
+
+#define CONTROL_IO_TIMEOUT_MS 1000
+#define DATA_IO_TIMEOUT_MS 1000
 
 struct display_ctx {
     int      ctrl_fd;
@@ -25,6 +31,11 @@ struct display_ctx {
     uint32_t screen_w, screen_h;
     uint32_t pixel_format;
     atomic_bool fallback;
+    atomic_bool control_dead;
+    atomic_bool aborting;
+    uint64_t    transport_generation;
+    uint64_t    frame_generation;
+    uint64_t    event_generation;
     bool        buffer_pending;
 
     /* The display lib is called concurrently: the render thread (select_dmabuf /
@@ -62,6 +73,61 @@ static void set_fallback(display_ctx *ctx, bool fallback)
     atomic_store_explicit(&ctx->fallback, fallback, memory_order_release);
 }
 
+static void set_control_dead(display_ctx *ctx)
+{
+    atomic_store_explicit(&ctx->control_dead, true, memory_order_release);
+}
+
+static int dup_cloexec(int fd)
+{
+    return fd < 0 ? -1 : fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
+static int64_t monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int recv_exact_progress(int fd, void *buffer, size_t size, int timeout_ms)
+{
+    uint8_t *cursor = buffer;
+    size_t received = 0;
+    int64_t deadline = monotonic_ms();
+    if (deadline < 0)
+        return -1;
+    deadline += timeout_ms;
+
+    while (received < size) {
+        int64_t remaining = deadline - monotonic_ms();
+        if (remaining <= 0)
+            return -1;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int ret = poll(&pfd, 1, remaining > INT32_MAX ? INT32_MAX : (int)remaining);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (ret == 0 || (pfd.revents & (POLLERR | POLLNVAL)) ||
+            (!(pfd.revents & POLLIN) && (pfd.revents & POLLHUP)))
+            return -1;
+        if (!(pfd.revents & POLLIN))
+            continue;
+        ssize_t count = recv(fd, cursor + received, size - received, MSG_DONTWAIT);
+        if (count > 0) {
+            received += (size_t)count;
+            continue;
+        }
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        return -1;
+    }
+    return 0;
+}
+
 void allocate_services(struct display_ctx *ctx, struct service_info *services, int num_services){
     ctx->services = services;
     ctx->num_services = num_services;
@@ -85,7 +151,10 @@ void handle_resource_request(struct display_ctx *ctx, struct OutputEvent *event)
     for(i=0;i<ctx->num_services;i++){
         if(ctx->services[i].type == service_type){
             //if failed fds=NULL, num=0
-            struct resources res = ctx->services[i].allocate_resource(event->resources_request.args, ctx->services[i].userdata);
+            uint32_t args[3];
+            memcpy(args, event->resources_request.args, sizeof(args));
+            struct resources res = ctx->services[i].allocate_resource(
+                args, ctx->services[i].userdata);
             if (ctx->resources[i].type != -1) {
                 // free previous resource if it was allocated
                 ctx->services[i].free_resource(ctx->resources[i], ctx->services[i].userdata);
@@ -166,10 +235,20 @@ static int send_hello_fds(display_ctx *ctx)
     ctx->data_fd  = sv[0];
     ctx->fence_fd = fv[0];
     ctx->audio_fd = av[0];
+    struct timeval send_timeout = { .tv_sec = 1, .tv_usec = 0 };
+    if (setsockopt(ctx->data_fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &send_timeout, sizeof(send_timeout)) < 0) {
+        close(sv[1]);
+        close(fv[1]);
+        close(av[1]);
+        return -1;
+    }
 
     struct ctrl_msg hdr = { .type = CTRL_MSG_CONSUMER_HELLO, .size = 0 };
     int fds[5] = { ctx->buf_ready_efd, fv[1], sv[1], ctx->shm_fd, av[1] };
-    int ret = send_fds(ctx->ctrl_fd, &hdr, sizeof(hdr), fds, 5);
+    int64_t deadline = socket_deadline_after_ms(CONTROL_IO_TIMEOUT_MS);
+    int ret = deadline < 0 ? -1 : send_fds_deadline(
+        ctx->ctrl_fd, &hdr, sizeof(hdr), fds, 5, deadline);
     close(sv[1]);
     close(fv[1]);
     close(av[1]);
@@ -177,6 +256,7 @@ static int send_hello_fds(display_ctx *ctx)
 }
 
 static void enter_fallback(display_ctx *ctx);
+static void enter_fallback_if_generation(display_ctx *ctx, uint64_t generation);
 static void reset_transport_locked(display_ctx *ctx);
 
 static bool push_dmabufs_locked(display_ctx *ctx)
@@ -189,11 +269,12 @@ static bool push_dmabufs_locked(display_ctx *ctx)
         .size = ctx->stored_count * sizeof(struct buf_info),
     };
     int fd = ctx->data_fd;
-    return fd >= 0 &&
-           send_fds(fd, &dhdr, sizeof(dhdr),
-                    ctx->stored_fds, ctx->stored_count) >= 0 &&
-           send_all(fd, ctx->stored_infos,
-                    ctx->stored_count * sizeof(struct buf_info)) == 0;
+    int64_t deadline = socket_deadline_after_ms(DATA_IO_TIMEOUT_MS);
+    return fd >= 0 && deadline >= 0 &&
+           send_fds_deadline(fd, &dhdr, sizeof(dhdr), ctx->stored_fds,
+                             ctx->stored_count, deadline) >= 0 &&
+           send_all_deadline(fd, ctx->stored_infos,
+                             ctx->stored_count * sizeof(struct buf_info), deadline) == 0;
 }
 
 static int push_dmabufs_internal(display_ctx *ctx)
@@ -218,17 +299,47 @@ static int push_dmabufs_internal(display_ctx *ctx)
  * render thread via select_dmabuf, but the locking keeps future call sites correct. */
 static bool try_exit_fallback(display_ctx *ctx)
 {
-    if (!is_fallback(ctx))
+    if (!is_fallback(ctx) || atomic_load_explicit(&ctx->aborting, memory_order_acquire))
         return false;
 
-    struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
-    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
+    pthread_mutex_lock(&ctx->state_lock);
+    int ctrl_fd = dup_cloexec(ctx->ctrl_fd);
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (ctrl_fd < 0) {
+        set_control_dead(ctx);
         return false;
+    }
+
+    struct pollfd pfd = { .fd = ctrl_fd, .events = POLLIN };
+    int ret = poll(&pfd, 1, 0);
+    if (ret < 0) {
+        close(ctrl_fd);
+        if (errno != EINTR)
+            set_control_dead(ctx);
+        return false;
+    }
+    if (ret == 0) {
+        close(ctrl_fd);
+        return false;
+    }
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+        close(ctrl_fd);
+        set_control_dead(ctx);
+        return false;
+    }
+    if (!(pfd.revents & POLLIN)) {
+        close(ctrl_fd);
+        return false;
+    }
 
     struct ctrl_msg hdr;
-    if (recv_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) != 0 ||
-        hdr.type != CTRL_MSG_FDS_READY)
+    bool valid = recv_exact_progress(ctrl_fd, &hdr, sizeof(hdr), 1000) == 0 &&
+                 hdr.type == CTRL_MSG_FDS_READY && hdr.size == 0;
+    close(ctrl_fd);
+    if (!valid) {
+        set_control_dead(ctx);
         return false;
+    }
 
     /* Hold state_lock -> data_lock while publishing the new session and replaying
      * BUFS_READY. Input writers cannot observe active state until the producer has
@@ -256,38 +367,53 @@ static bool try_exit_fallback(display_ctx *ctx)
 
 static void reset_transport_locked(display_ctx *ctx)
 {
-    if (ctx->data_fd >= 0)         { int fd = ctx->data_fd; ctx->data_fd = -1; close(fd); }
+    ctx->transport_generation++;
+    if (ctx->transport_generation == 0)
+        ctx->transport_generation = 1;
+    ctx->frame_generation = 0;
+    ctx->event_generation = 0;
+    if (ctx->data_fd >= 0)         { int fd = ctx->data_fd; ctx->data_fd = -1; shutdown(fd, SHUT_RDWR); close(fd); }
     if (ctx->buf_ready_efd >= 0)   { close(ctx->buf_ready_efd);   ctx->buf_ready_efd = -1; }
-    if (ctx->fence_fd >= 0)        { close(ctx->fence_fd);        ctx->fence_fd = -1; }
-    if (ctx->audio_fd >= 0)        { close(ctx->audio_fd);        ctx->audio_fd = -1; }
+    if (ctx->fence_fd >= 0)        { shutdown(ctx->fence_fd, SHUT_RDWR); close(ctx->fence_fd); ctx->fence_fd = -1; }
+    if (ctx->audio_fd >= 0)        { shutdown(ctx->audio_fd, SHUT_RDWR); close(ctx->audio_fd); ctx->audio_fd = -1; }
     if (ctx->shm_ptr) { volatile uint32_t *p = ctx->shm_ptr; ctx->shm_ptr = NULL; munmap((void *)p, sizeof(uint32_t)); }
     if (ctx->shm_fd >= 0)         { close(ctx->shm_fd);           ctx->shm_fd = -1; }
 
     ctx->buf_ready_efd = eventfd(0, EFD_CLOEXEC);
-    if (create_shm(ctx) == 0)
-        send_hello_fds(ctx);
+    if (ctx->buf_ready_efd < 0 || create_shm(ctx) < 0 || send_hello_fds(ctx) < 0)
+        set_control_dead(ctx);
 }
 
-static void enter_fallback(display_ctx *ctx)
+static void enter_fallback_for_generation(display_ctx *ctx, uint64_t generation)
 {
-    /* Atomic test-and-set of `fallback` so two threads (render timeout + event/input
-     * send failure) can't both tear the connection down (double close/munmap/cb). */
     pthread_mutex_lock(&ctx->state_lock);
-    if (is_fallback(ctx)) {
+    if (is_fallback(ctx) || (generation != 0 && generation != ctx->transport_generation)) {
         pthread_mutex_unlock(&ctx->state_lock);
         return;
     }
     set_fallback(ctx, true);
     free_resources(ctx);
     ctx->buffer_pending = false;
-    pthread_mutex_lock(&ctx->data_lock);
-    reset_transport_locked(ctx);
-    pthread_mutex_unlock(&ctx->data_lock);
+    bool aborting = atomic_load_explicit(&ctx->aborting, memory_order_acquire);
+    if (!aborting) {
+        pthread_mutex_lock(&ctx->data_lock);
+        reset_transport_locked(ctx);
+        pthread_mutex_unlock(&ctx->data_lock);
+    }
     pthread_mutex_unlock(&ctx->state_lock);
 
-    /* User callback (JNI, stops the event thread) runs OUTSIDE both locks. */
     if (ctx->fallback_cb)
         ctx->fallback_cb(ctx->fallback_userdata);
+}
+
+static void enter_fallback(display_ctx *ctx)
+{
+    enter_fallback_for_generation(ctx, 0);
+}
+
+static void enter_fallback_if_generation(display_ctx *ctx, uint64_t generation)
+{
+    enter_fallback_for_generation(ctx, generation);
 }
 int connect_to_deamon(display_ctx **out, const char *socket_path){
     return connect_to_deamon_with_fd(out, connect_unix(socket_path));
@@ -295,8 +421,11 @@ int connect_to_deamon(display_ctx **out, const char *socket_path){
 int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
 {
     display_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx)
+    if (!ctx) {
+        if (ctrl_fd >= 0)
+            close(ctrl_fd);
         return -1;
+    }
 
     pthread_mutex_init(&ctx->state_lock, NULL);
     pthread_mutex_init(&ctx->data_lock, NULL);
@@ -309,6 +438,11 @@ int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
     ctx->audio_fd = -1;
     ctx->shm_ptr = NULL;
     atomic_init(&ctx->fallback, true);
+    atomic_init(&ctx->control_dead, false);
+    atomic_init(&ctx->aborting, false);
+    ctx->transport_generation = 1;
+    ctx->frame_generation = 0;
+    ctx->event_generation = 0;
 
     ctx->ctrl_fd = ctrl_fd;
     if (ctx->ctrl_fd < 0)
@@ -371,28 +505,32 @@ int set_screen_info(display_ctx *ctx, uint32_t width, uint32_t height, uint32_t 
     uint8_t msg[sizeof(struct ctrl_msg) + sizeof(struct screen_info)];
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), &si, sizeof(si));
-    return send_all(ctx->ctrl_fd, msg, sizeof(msg));
+    int64_t deadline = socket_deadline_after_ms(CONTROL_IO_TIMEOUT_MS);
+    return deadline < 0 ? -1 :
+           send_all_deadline(ctx->ctrl_fd, msg, sizeof(msg), deadline);
 }
 
 int push_dmabufs(display_ctx *ctx, const int *fds, const struct buf_info *infos, int count)
 {
-    if (count > MAX_BUFS) count = MAX_BUFS;
-    memcpy(ctx->stored_fds, fds, count * sizeof(int));
-    memcpy(ctx->stored_infos, infos, count * sizeof(struct buf_info));
+    if (!ctx || !fds || !infos || count <= 0 || count > MAX_BUFS)
+        return -1;
+    memcpy(ctx->stored_fds, fds, (size_t)count * sizeof(int));
+    memcpy(ctx->stored_infos, infos, (size_t)count * sizeof(struct buf_info));
     ctx->stored_count = count;
 
     if (is_fallback(ctx))
         return 0;
 
     int ret = push_dmabufs_internal(ctx);
-    enter_fallback(ctx);
+    if (ret < 0)
+        enter_fallback(ctx);
     return ret;
 }
 
 int select_dmabuf(display_ctx *ctx, int idx)
 {
     if (is_fallback(ctx)) {
-        try_exit_fallback(ctx);   /* holds state_lock internally for the transition */
+        try_exit_fallback(ctx);
         if (is_fallback(ctx))
             return 0;
     }
@@ -400,10 +538,23 @@ int select_dmabuf(display_ctx *ctx, int idx)
     if (idx < 0 || idx >= ctx->stored_count)
         return -1;
 
+    pthread_mutex_lock(&ctx->state_lock);
+    if (is_fallback(ctx) || !ctx->shm_ptr || ctx->buf_ready_efd < 0) {
+        pthread_mutex_unlock(&ctx->state_lock);
+        return 0;
+    }
     *ctx->shm_ptr = (uint32_t)idx;
     eventfd_t val = 1;
-    eventfd_write(ctx->buf_ready_efd, val);
-    ctx->buffer_pending = true;
+    int result = eventfd_write(ctx->buf_ready_efd, val);
+    if (result == 0) {
+        ctx->buffer_pending = true;
+        ctx->frame_generation = ctx->transport_generation;
+    }
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (result < 0) {
+        enter_fallback(ctx);
+        return -1;
+    }
     return 0;
 }
 
@@ -416,47 +567,98 @@ int select_dmabuf(display_ctx *ctx, int idx)
  * on error. */
 int refresh_done(display_ctx *ctx)
 {
-    if (!ctx->buffer_pending)
-        return -1;
-
-    /* Block (with a 5s safety timeout) on the fence channel: the arrival of the
-     * producer's per-frame message is the render-done signal. Timeout / no POLLIN
-     * (producer stalled or gone) -> fall back so the render thread never hangs. */
-    struct pollfd pfd = { .fd = ctx->fence_fd, .events = POLLIN };
-    int ret = poll(&pfd, 1, 5000);
-    if (ret <= 0 || !(pfd.revents & POLLIN)) {
-        enter_fallback(ctx);
+    pthread_mutex_lock(&ctx->state_lock);
+    if (!ctx->buffer_pending || is_fallback(ctx)) {
+        pthread_mutex_unlock(&ctx->state_lock);
         return -1;
     }
-    ctx->buffer_pending = false;
+    uint64_t generation = ctx->frame_generation;
+    int fence_fd = dup_cloexec(ctx->fence_fd);
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (fence_fd < 0) {
+        enter_fallback_if_generation(ctx, generation);
+        return -1;
+    }
+
+    struct pollfd pfd = { .fd = fence_fd, .events = POLLIN };
+    int ret = poll(&pfd, 1, 5000);
+    bool failed = ret <= 0 || (pfd.revents & (POLLERR | POLLNVAL)) ||
+                  !(pfd.revents & POLLIN);
 
     int rfence = -1;
-    char b;
-    struct iovec iov = { .iov_base = &b, .iov_len = 1 };
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } cmsg;
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cmsg.buf,
-        .msg_controllen = sizeof(cmsg.buf),
-    };
-    /* Non-blocking even though poll reported POLLIN: if a concurrent enter_fallback
-     * (from a JNI input thread) swapped fence_fd between the poll and this recvmsg,
-     * we get EAGAIN (n < 0) instead of reading a stale/foreign socket. A clean EOF
-     * (n == 0) means the producer closed the channel -> fall back. No fence in the
-     * message => queue with -1 ("ready now"). */
-    ssize_t n = recvmsg(ctx->fence_fd, &msg, MSG_DONTWAIT);
-    if (n == 0) {
-        enter_fallback(ctx);
+    if (!failed) {
+        char byte;
+        struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
+        union {
+            char buf[CMSG_SPACE(sizeof(int) * 8)];
+            struct cmsghdr align;
+        } cmsg;
+        memset(&cmsg, 0, sizeof(cmsg));
+        struct msghdr msg = {
+            .msg_iov = &iov,
+            .msg_iovlen = 1,
+            .msg_control = cmsg.buf,
+            .msg_controllen = sizeof(cmsg.buf),
+        };
+        ssize_t count = recvmsg(fence_fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+        if (count != 1) {
+            failed = true;
+        } else {
+            int received_fds[8];
+            int received_count = 0;
+            int control_count = 0;
+            bool control_valid = !(msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC));
+            for (struct cmsghdr *control = CMSG_FIRSTHDR(&msg); control;
+                 control = CMSG_NXTHDR(&msg, control)) {
+                control_count++;
+                if (control->cmsg_level != SOL_SOCKET ||
+                    control->cmsg_type != SCM_RIGHTS ||
+                    control->cmsg_len < CMSG_LEN(0)) {
+                    control_valid = false;
+                    continue;
+                }
+                size_t bytes = control->cmsg_len - CMSG_LEN(0);
+                if (bytes % sizeof(int) != 0 ||
+                    bytes / sizeof(int) > (size_t)(8 - received_count)) {
+                    control_valid = false;
+                    continue;
+                }
+                int fds = (int)(bytes / sizeof(int));
+                memcpy(received_fds + received_count, CMSG_DATA(control), bytes);
+                received_count += fds;
+            }
+            control_valid = control_valid &&
+                ((control_count == 0 && received_count == 0) ||
+                 (control_count == 1 && received_count == 1));
+            if (control_valid && received_count == 1) {
+                rfence = received_fds[0];
+            } else {
+                for (int i = 0; i < received_count; i++)
+                    close(received_fds[i]);
+                failed = !control_valid;
+            }
+        }
+    }
+    close(fence_fd);
+
+    pthread_mutex_lock(&ctx->state_lock);
+    bool current = !is_fallback(ctx) && generation != 0 &&
+                   generation == ctx->transport_generation &&
+                   generation == ctx->frame_generation;
+    if (current)
+        ctx->buffer_pending = false;
+    pthread_mutex_unlock(&ctx->state_lock);
+
+    if (!current) {
+        if (rfence >= 0)
+            close(rfence);
         return -1;
     }
-    if (n > 0) {
-        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-        if (c && c->cmsg_type == SCM_RIGHTS)
-            memcpy(&rfence, CMSG_DATA(c), sizeof(int));
+    if (failed) {
+        if (rfence >= 0)
+            close(rfence);
+        enter_fallback_if_generation(ctx, generation);
+        return -1;
     }
     return rfence;
 }
@@ -477,7 +679,9 @@ int push_input_event(display_ctx *ctx, const struct InputEvent *event)
         return 0;
     }
     int fd = ctx->data_fd;
-    int r = (fd >= 0) ? send_all(fd, msg, sizeof(msg)) : -1;
+    int64_t deadline = socket_deadline_after_ms(DATA_IO_TIMEOUT_MS);
+    int r = (fd >= 0 && deadline >= 0) ?
+            send_all_deadline(fd, msg, sizeof(msg), deadline) : -1;
     pthread_mutex_unlock(&ctx->data_lock);
 
     if (r < 0) {
@@ -491,9 +695,12 @@ int push_input_event_with_length(display_ctx *ctx, const struct InputEvent *even
     if (is_fallback(ctx))
         return 0;
 
+    if ((size > 0 && !payload) ||
+        size > SIZE_MAX - sizeof(struct data_msg) - sizeof(struct InputEvent))
+        return -1;
     struct data_msg hdr = { .type = DATA_MSG_INPUT_EVENT, .size = sizeof(struct InputEvent) };
     size_t total = sizeof(struct data_msg) + sizeof(struct InputEvent) + size;
-    uint8_t *msg = (uint8_t *)malloc(total);
+    uint8_t *msg = malloc(total);
     if (!msg)
         return -1;
     memcpy(msg, &hdr, sizeof(hdr));
@@ -508,7 +715,9 @@ int push_input_event_with_length(display_ctx *ctx, const struct InputEvent *even
         return 0;
     }
     int fd = ctx->data_fd;
-    int r = (fd >= 0) ? send_all(fd, msg, total) : -1;
+    int64_t deadline = socket_deadline_after_ms(DATA_IO_TIMEOUT_MS);
+    int r = (fd >= 0 && deadline >= 0) ?
+            send_all_deadline(fd, msg, total, deadline) : -1;
     pthread_mutex_unlock(&ctx->data_lock);
 
     free(msg);
@@ -520,56 +729,99 @@ int push_input_event_with_length(display_ctx *ctx, const struct InputEvent *even
 }
 int poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_ms)
 {
-    if (is_fallback(ctx))
+    pthread_mutex_lock(&ctx->state_lock);
+    if (is_fallback(ctx)) {
+        pthread_mutex_unlock(&ctx->state_lock);
         return 0;
+    }
+    uint64_t generation = ctx->transport_generation;
+    int data_fd = dup_cloexec(ctx->data_fd);
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (data_fd < 0) {
+        enter_fallback_if_generation(ctx, generation);
+        return -1;
+    }
 
-    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
+    struct pollfd pfd = { .fd = data_fd, .events = POLLIN };
     int ret = poll(&pfd, 1, timeout_ms);
-    if (ret <= 0)
+    if (ret == 0) {
+        close(data_fd);
         return 0;
-
-    if (pfd.revents & (POLLHUP | POLLERR)) {
-        enter_fallback(ctx);
+    }
+    if (ret < 0) {
+        close(data_fd);
+        if (errno == EINTR)
+            return 0;
+        enter_fallback_if_generation(ctx, generation);
         return -1;
     }
-
-    /* Consume the message directly -- no MSG_PEEK pre-check. The producer ->
-     * consumer direction only ever carries OUTPUT_EVENT (render-done moved to
-     * the dedicated fence channel) and both push_output_event* variants frame
-     * it at exactly sizeof(struct OutputEvent), so what to read next is fully
-     * determined; the peek cost one extra syscall per event. A mismatched
-     * header can only mean the stream desynced: fall back rather than leaving
-     * bytes wedged in the socket. */
-    uint8_t msg_buf[sizeof(struct data_msg) + sizeof(struct OutputEvent)];
-    if (recv_all(ctx->data_fd, msg_buf, sizeof(msg_buf)) < 0)
-        return -1;
-
-    struct data_msg hdr;
-    memcpy(&hdr, msg_buf, sizeof(hdr));
-    if (hdr.type != DATA_MSG_OUTPUT_EVENT || hdr.size != sizeof(struct OutputEvent)) {
-        enter_fallback(ctx);
+    if (pfd.revents & (POLLERR | POLLNVAL)) {
+        close(data_fd);
+        enter_fallback_if_generation(ctx, generation);
         return -1;
     }
+    if (!(pfd.revents & POLLIN)) {
+        close(data_fd);
+        if (pfd.revents & POLLHUP) {
+            enter_fallback_if_generation(ctx, generation);
+            return -1;
+        }
+        return 0;
+    }
 
-    memcpy(event, msg_buf + sizeof(struct data_msg), sizeof(*event));
+    uint8_t message[sizeof(struct data_msg) + sizeof(struct OutputEvent)];
+    bool valid = (pfd.revents & POLLIN) &&
+                 recv_exact_progress(data_fd, message, sizeof(message), 1000) == 0;
+    close(data_fd);
+    if (valid) {
+        struct data_msg header;
+        memcpy(&header, message, sizeof(header));
+        valid = header.type == DATA_MSG_OUTPUT_EVENT &&
+                header.size == sizeof(struct OutputEvent);
+    }
+
+    pthread_mutex_lock(&ctx->state_lock);
+    bool current = !is_fallback(ctx) && generation == ctx->transport_generation;
+    if (valid && current)
+        ctx->event_generation = generation;
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (!current)
+        return 0;
+    if (!valid) {
+        enter_fallback_if_generation(ctx, generation);
+        return -1;
+    }
+    memcpy(event, message + sizeof(struct data_msg), sizeof(*event));
     return 1;
 }
+
 int poll_output_event_extend_data(display_ctx *ctx, void* payload, size_t size, int timeout_ms)
 {
-    if (is_fallback(ctx))
+    pthread_mutex_lock(&ctx->state_lock);
+    uint64_t generation = ctx->event_generation;
+    if (is_fallback(ctx) || generation == 0 || generation != ctx->transport_generation) {
+        pthread_mutex_unlock(&ctx->state_lock);
         return 0;
-
-    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
-    int ret = poll(&pfd, 1, timeout_ms);
-    if (ret <= 0)
-        return 0;
-
-    if (pfd.revents & (POLLHUP | POLLERR)) {
-        enter_fallback(ctx);
+    }
+    int data_fd = dup_cloexec(ctx->data_fd);
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (data_fd < 0) {
+        enter_fallback_if_generation(ctx, generation);
         return -1;
     }
-    if (recv_all(ctx->data_fd, payload, size) < 0)
+
+    bool received = size == 0 || recv_exact_progress(data_fd, payload, size, timeout_ms) == 0;
+    close(data_fd);
+    pthread_mutex_lock(&ctx->state_lock);
+    bool current = !is_fallback(ctx) && generation == ctx->transport_generation &&
+                   generation == ctx->event_generation;
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (!current)
+        return 0;
+    if (!received) {
+        enter_fallback_if_generation(ctx, generation);
         return -1;
+    }
     return 1;
 }
 int set_fallback_callback(display_ctx *ctx, void (*on_fallback)(void *), void *userdata)
@@ -596,6 +848,56 @@ int get_audio_fd(display_ctx *ctx)
 {
     return is_fallback(ctx) ? -1 : ctx->audio_fd;
 }
+
+int dup_audio_fd(display_ctx *ctx, uint64_t *generation)
+{
+    if (!ctx || !generation)
+        return -1;
+    pthread_mutex_lock(&ctx->state_lock);
+    int fd = is_fallback(ctx) ? -1 : dup_cloexec(ctx->audio_fd);
+    *generation = fd >= 0 ? ctx->transport_generation : 0;
+    pthread_mutex_unlock(&ctx->state_lock);
+    return fd;
+}
+
+void display_consumer_fail_transport(display_ctx *ctx)
+{
+    if (ctx)
+        enter_fallback(ctx);
+}
+
+void display_consumer_abort_io(display_ctx *ctx)
+{
+    if (!ctx)
+        return;
+    atomic_store_explicit(&ctx->aborting, true, memory_order_release);
+    pthread_mutex_lock(&ctx->state_lock);
+    if (ctx->data_fd >= 0)
+        shutdown(ctx->data_fd, SHUT_RDWR);
+    if (ctx->fence_fd >= 0)
+        shutdown(ctx->fence_fd, SHUT_RDWR);
+    if (ctx->audio_fd >= 0)
+        shutdown(ctx->audio_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&ctx->state_lock);
+}
+
+int display_consumer_needs_reconnect(display_ctx *ctx)
+{
+    if (!ctx)
+        return 1;
+    if (atomic_load_explicit(&ctx->control_dead, memory_order_acquire))
+        return 1;
+
+    struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
+    int ret = poll(&pfd, 1, 0);
+    if (ret < 0) {
+        if (errno != EINTR)
+            set_control_dead(ctx);
+    } else if (ret > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+        set_control_dead(ctx);
+    }
+    return atomic_load_explicit(&ctx->control_dead, memory_order_acquire) ? 1 : 0;
+}
 //用于处理未处理的变长payload事件
 void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event)
 {
@@ -605,10 +907,12 @@ void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event)
         //客户端发送了一个剪贴板事件，后续会有变长数据跟随，但是库调用者没有处理这个事件，所以我们需要把后续的变长数据读掉，避免阻塞
         if (event->clipboard.size > 0) {
             void* payload = malloc(event->clipboard.size);
-            if (payload) {
-                poll_output_event_extend_data(ctx, payload, event->clipboard.size, 1000);
-                free(payload);
+            if (!payload) {
+                display_consumer_fail_transport(ctx);
+                return;
             }
+            poll_output_event_extend_data(ctx, payload, event->clipboard.size, 1000);
+            free(payload);
         }
         break;
     default:
@@ -636,10 +940,13 @@ void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event,
         return;
     }
     int fd = ctx->data_fd;
-    bool ok = (fd >= 0) && send_all(fd, msg, sizeof(msg)) == 0;
+    int64_t deadline = socket_deadline_after_ms(DATA_IO_TIMEOUT_MS);
+    bool ok = fd >= 0 && deadline >= 0 &&
+              send_all_deadline(fd, msg, sizeof(msg), deadline) == 0;
     if (ok && fd_count > 0) {
         struct data_msg fhdr = { .type = DATA_MSG_INPUT_EXTEND_FDS, .size = 0 };
-        ok = send_fds(fd, &fhdr, sizeof(fhdr), fds, fd_count) >= 0;
+        ok = send_fds_deadline(fd, &fhdr, sizeof(fhdr), fds, fd_count,
+                               deadline) >= 0;
     }
     pthread_mutex_unlock(&ctx->data_lock);
 

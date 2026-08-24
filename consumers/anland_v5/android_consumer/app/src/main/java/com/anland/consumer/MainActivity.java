@@ -39,8 +39,6 @@ import android.widget.FrameLayout;
 import android.util.DisplayMetrics;   // ADDED
 
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 
 public class MainActivity extends Activity
@@ -127,48 +125,13 @@ public class MainActivity extends Activity
     // Layout JSON the current bar was built from; used to detect edits on resume.
     private String mAppliedLayoutJson = "";
 
-    public static MainActivity sInstance;
-    private static volatile boolean sRemoteBridgeActive;
+    private static MainActivity sFocusedInstance;
     private boolean mResumed;
+    private boolean mUsesSharedDefaultSession;
+    private DisplaySession mDisplaySession;
 
-    static void setRemoteBridgeActiveSync(boolean active) {
-        sRemoteBridgeActive = active;
-        MainActivity activity = sInstance;
-        if (activity == null) return;
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            activity.onRemoteBridgeStateChanged(active);
-            return;
-        }
-
-        CountDownLatch applied = new CountDownLatch(1);
-        activity.runOnUiThread(() -> {
-            try {
-                activity.onRemoteBridgeStateChanged(active);
-            } finally {
-                applied.countDown();
-            }
-        });
-        try {
-            if (!applied.await(5, TimeUnit.SECONDS)) {
-                Log.w(TAG, "Timed out switching anland consumer for RDP bridge");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private void onRemoteBridgeStateChanged(boolean active) {
-        if (mNative == null) return;
-        if (active) {
-            mNative.stop();
-        } else if (mResumed && surfaceReady) {
-            applyConnectionConfig();
-            startNative(surfaceView.getHolder().getSurface());
-            pushRefreshRate();
-            applyMicState();
-            applyAudioLatency();
-            applyAudioKeepalive();
-        }
+    static MainActivity focusedInstance() {
+        return sFocusedInstance;
     }
 
     // ADDED: VirtualKeyboardView instance
@@ -313,6 +276,14 @@ public class MainActivity extends Activity
         });
     }
 
+    public void onNativeFanoutFailed(long generation) {
+        runOnUiThread(() -> {
+            if (mUsesSharedDefaultSession && mDisplaySession != null) {
+                mDisplaySession.onFanoutFailed(this, generation);
+            }
+        });
+    }
+
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
@@ -325,7 +296,7 @@ public class MainActivity extends Activity
         if (hasFocus) {
             // Become the accessibility-key target and the focused instance, so real
             // camera frames route to this window (others get blank frames).
-            sInstance = this;
+            sFocusedInstance = this;
             if (mNative != null) mNative.setFocused(true);
         }
         if (hasFocus && clipboard != null) {
@@ -347,6 +318,8 @@ public class MainActivity extends Activity
     }
 
     private void pushRefreshRate() {
+        if (mUsesSharedDefaultSession && mDisplaySession != null
+                && !mDisplaySession.usesLocalRefreshRate()) return;
         Display d = getDisplay();
         if (d != null)
             mNative.setRefreshRate(d.getRefreshRate());
@@ -400,7 +373,17 @@ public class MainActivity extends Activity
             finish();
             return;
         }
-        mNative.start(surface, clipboard, this);
+        boolean started;
+        if (mUsesSharedDefaultSession) {
+            started = mDisplaySession.attachLocalSurface(surface, this, viewWidth, viewHeight);
+        } else {
+            started = mNative.start(surface, clipboard, this);
+        }
+        if (!started) {
+            Log.e(TAG, "Native display route failed to start");
+            android.widget.Toast.makeText(this, "Unable to start anland display",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        }
     }
 
     // True only when `path` exists and is a unix-domain socket. In root mode the
@@ -464,9 +447,9 @@ public class MainActivity extends Activity
 
         setupMediaAudio();
         applyOrientation();
-        if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getBoolean(BridgeService.KEY_ENABLED, false)) {
-            BridgeService.setEnabled(this, true);
+        DisplaySession.Mode bridgeMode = BridgeService.getMode(this);
+        if (bridgeMode != DisplaySession.Mode.LOCAL) {
+            startForegroundService(new Intent(this, BridgeService.class));
         }
 
         // Apply the launch parameters: socket path (overrides the saved pref) and
@@ -508,13 +491,21 @@ public class MainActivity extends Activity
             return;
         }
 
-        sInstance = this;
+        sFocusedInstance = this;
 
-        // Each window owns its own native pipeline.
-        mNative = new Native();
+        // The launcher/default output is process-owned so its transport survives the
+        // Activity while a remote viewer is connected. Parameter/secondary windows
+        // remain independent consumers targeting their own daemon sockets.
+        mUsesSharedDefaultSession = getClass() == MainActivity.class && mSocketOverride == null;
+        if (mUsesSharedDefaultSession) {
+            mDisplaySession = DisplaySession.get(this);
+            mNative = mDisplaySession.nativeTransport();
+            clipboard = mDisplaySession.clipboard();
+        } else {
+            mNative = new Native();
+            clipboard = new Clipboard(this, mNative);
+        }
         setTaskDescription(new ActivityManager.TaskDescription(mWindowName));
-
-        clipboard = new Clipboard(this, mNative);
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
@@ -1041,14 +1032,28 @@ public class MainActivity extends Activity
         pointerY = Math.max(originY, Math.min(pointerY, originY + height));
     }
 
+    private int activeOutputWidth() {
+        if (mUsesSharedDefaultSession && mDisplaySession != null
+                && mDisplaySession.outputWidth() > 0) return mDisplaySession.outputWidth();
+        return customScreenWidth;
+    }
+
+    private int activeOutputHeight() {
+        if (mUsesSharedDefaultSession && mDisplaySession != null
+                && mDisplaySession.outputHeight() > 0) return mDisplaySession.outputHeight();
+        return customScreenHeight;
+    }
+
     private float pointerScaleX() {
-        return (customScreenWidth > 0 && pointerViewWidth() > 0)
-                ? (float) customScreenWidth / pointerViewWidth() : 1.0f;
+        int width = activeOutputWidth();
+        return (width > 0 && pointerViewWidth() > 0)
+                ? (float) width / pointerViewWidth() : 1.0f;
     }
 
     private float pointerScaleY() {
-        return (customScreenHeight > 0 && pointerViewHeight() > 0)
-                ? (float) customScreenHeight / pointerViewHeight() : 1.0f;
+        int height = activeOutputHeight();
+        return (height > 0 && pointerViewHeight() > 0)
+                ? (float) height / pointerViewHeight() : 1.0f;
     }
 
     /** Handle mouse and hardware-touchpad events delivered through pointer capture. */
@@ -1555,8 +1560,8 @@ public class MainActivity extends Activity
         // and registers SERVICE_TYPE_CAMERA on the very first connect rather than a
         // later reconnect. Idempotent, so safe to call on every resume.
         applyCameraState();
-        if (surfaceReady && !sRemoteBridgeActive) {
-            mNative.stop();
+        if (surfaceReady) {
+            if (!mUsesSharedDefaultSession) mNative.stop();
             applyConnectionConfig();
             startNative(surfaceView.getHolder().getSurface());
             pushRefreshRate();
@@ -1599,7 +1604,8 @@ public class MainActivity extends Activity
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.unregisterDisplayListener(displayListener);
-        mNative.stop();
+        if (mUsesSharedDefaultSession) mDisplaySession.suspendLocalSurface(this);
+        else mNative.stop();
         abandonMediaAudioFocus();
     }
 
@@ -1614,14 +1620,15 @@ public class MainActivity extends Activity
         }
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(NOTIFICATION_ID);
-        // Release only THIS window's native pipeline (its consumer_state, audio bridge
-        // and camera client). The camera service itself is a process-global shared by
-        // every window, so it is intentionally not torn down here -- destroying it
-        // would cut the camera for the other open windows.
-        if (mNative != null) {
+        if (sFocusedInstance == this) sFocusedInstance = null;
+        // The default transport belongs to DisplaySession and can outlive this Activity.
+        // Secondary/parameter windows still release only their independent pipeline.
+        if (mUsesSharedDefaultSession && mDisplaySession != null) {
+            mDisplaySession.suspendLocalSurface(this);
+        } else if (mNative != null) {
             mNative.destroy();
-            mNative = null;
         }
+        mNative = null;
         cameraInited = false;
         super.onDestroy();
     }
@@ -1720,10 +1727,10 @@ public class MainActivity extends Activity
         updateDisplayRotation();
         ensurePointerPosition();
         surfaceReady = true;
-        // Same ordering guarantee as onResume: camera service settled before connect.
-        applyCameraState();
-        if (!sRemoteBridgeActive) {
-            mNative.stop();
+        if (mResumed) {
+            // Same ordering guarantee as onResume: camera service settled before connect.
+            applyCameraState();
+            if (!mUsesSharedDefaultSession) mNative.stop();
             applyConnectionConfig();
             startNative(holder.getSurface());
             pushRefreshRate();
@@ -1743,7 +1750,11 @@ public class MainActivity extends Activity
         surfaceReady = false;
         if (immersive != null) immersive.stop();
         releasePointerCapture(false);
-        mNative.stop();
+        if (mUsesSharedDefaultSession) {
+            mDisplaySession.detachLocalSurface(holder.getSurface(), this);
+        } else {
+            mNative.stop();
+        }
     }
 
 
@@ -2196,10 +2207,10 @@ public class MainActivity extends Activity
             if (action == MotionEvent.ACTION_HOVER_MOVE) {
                 float nativeX, nativeY;
                 if (autoStretch) {
-                    float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                            (float)customScreenWidth / viewWidth : 1.0f;
-                    float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                            (float)customScreenHeight / viewHeight : 1.0f;
+                    float scaleX = (activeOutputWidth() > 0 && viewWidth > 0) ?
+                            (float) activeOutputWidth() / viewWidth : 1.0f;
+                    float scaleY = (activeOutputHeight() > 0 && viewHeight > 0) ?
+                            (float) activeOutputHeight() / viewHeight : 1.0f;
                     nativeX = event.getX() * scaleX;
                     nativeY = event.getY() * scaleY;
                 } else {
@@ -2468,10 +2479,10 @@ public class MainActivity extends Activity
         
         float nativeX, nativeY;
         if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                       (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                       (float)customScreenHeight / viewHeight : 1.0f;
+            float scaleX = (activeOutputWidth() > 0 && viewWidth > 0)
+                    ? (float) activeOutputWidth() / viewWidth : 1.0f;
+            float scaleY = (activeOutputHeight() > 0 && viewHeight > 0)
+                    ? (float) activeOutputHeight() / viewHeight : 1.0f;
             nativeX = event.getX() * scaleX;
             nativeY = event.getY() * scaleY;
             if (event.getHistorySize() > 0) {
@@ -2553,10 +2564,10 @@ public class MainActivity extends Activity
     
     private float[] convertToNativeCoords(float x, float y) {
         if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                           (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                           (float)customScreenHeight / viewHeight : 1.0f;
+            float scaleX = (activeOutputWidth() > 0 && viewWidth > 0)
+                    ? (float) activeOutputWidth() / viewWidth : 1.0f;
+            float scaleY = (activeOutputHeight() > 0 && viewHeight > 0)
+                    ? (float) activeOutputHeight() / viewHeight : 1.0f;
             return new float[]{x * scaleX, y * scaleY};
         } else {
             return new float[]{(x - surfaceOffsetX) / surfaceScale, (y - surfaceOffsetY) / surfaceScale};
@@ -2565,10 +2576,10 @@ public class MainActivity extends Activity
     
     private float[] convertMouseToNative(float x, float y) {
         if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                           (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                           (float)customScreenHeight / viewHeight : 1.0f;
+            float scaleX = (activeOutputWidth() > 0 && viewWidth > 0)
+                    ? (float) activeOutputWidth() / viewWidth : 1.0f;
+            float scaleY = (activeOutputHeight() > 0 && viewHeight > 0)
+                    ? (float) activeOutputHeight() / viewHeight : 1.0f;
             return new float[]{x * scaleX, y * scaleY};
         } else {
             return new float[]{x / surfaceScale, y / surfaceScale};

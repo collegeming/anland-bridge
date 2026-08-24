@@ -9,7 +9,6 @@
     <!-- Capture the device camera(s) to forward to the Linux producer (Camera2 NDK). -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- Bring an already-open window's task to the front instead of opening a
@@ -18,6 +17,8 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:label="Anland"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"

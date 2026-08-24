@@ -31,7 +31,7 @@
 3. 仅选择硬件 H.264 encoder，不回退到 OpenH264 等软件编码；
 4. 输入直接写入 anland data socket，不经过 Android framework 的按键分发；
 5. PC 的 Win/Super 键保持原值，使 `Win+E`、`Win+T` 能作为 niri `Mod+E`、`Mod+T`；
-6. Android 与 Arch/proot 通过 loopback 本地 socket 通信，不依赖 ADB；
+6. Android 与 Droidspaces 容器默认通过 bind-mounted Unix socket `/data/local/tmp/anland-rdp/bridge.sock` 通信，不依赖 ADB 或共享 loopback；
 7. 没有 RDP EGFX viewer 时不启动 MediaCodec，降低待机发热。
 
 完整方案还包括：
@@ -53,27 +53,19 @@ Android consumer
     └─ 远程模式：MediaCodec input Surface → 硬件 H.264
                               │
                               ▼
-                  127.0.0.1:33910 认证桥
+      /data/local/tmp/anland-rdp/bridge.sock 私有认证桥
                               │
                               ▼
                   lamco-anland-bridge → mstsc
 ```
 
-远程模式是低功耗优先的**互斥模式**：启动远程编码前暂停本地 `SurfaceView` consumer；远程流停止后销毁 MediaCodec consumer 并恢复本地显示。当前没有同时本地显示和远程编码的 EGL fan-out。
+设置提供 `local`、`remote`、`both` 三种模式。`local` 使用 SurfaceView 直出；`remote` 在收到 stream 请求后使用 MediaCodec 直出；`both` 在有本地 Surface 且有 stream 时使用三槽 EGL/GLES GPU fan-out，无本地 Surface 的活动 stream 使用 MediaCodec 直出，空闲且无本地 Surface 时停止 display consumer/MediaCodec。fan-out 已实现 `EGL_ANDROID_image_native_buffer`、三槽跨上下文 ring、预检和运行时失败回退；若目标设备能力不足，则记录错误并回退到 remote-direct，此时不保证继续本地显示。以上 GPU 和设备兼容性仍需目标设备验证。
 
 ## 本次主要修改
 
 ### 1. Android 前台桥接服务
 
-Android 设置中新增“投屏桥接服务（RDP）”开关：
-
-- 启动 non-exported foreground service；
-- 仅监听 `127.0.0.1:33910`；
-- 自动生成 128-bit 随机令牌，以 32 位小写十六进制显示；
-- 每个连接的第一条消息必须是 `HELLO`；
-- 通过 `MessageDigest.isEqual` 校验令牌；
-- 令牌不写入日志；
-- 认证 socket 可以长期保持，但不会因此自动启动编码器。
+Android 设置中以三态输出模式替换旧开关；旧 `false` 精确迁移为 `local`，旧 `true` 精确迁移为 `remote`，迁移标记保证只执行一次。`remote`/`both` 启动 non-exported foreground service，Android 作为重连客户端，通过 root fd helper + `SCM_RIGHTS` 连接 `/data/local/tmp/anland-rdp/bridge.sock`，不会向普通应用暴露 root 路径。服务自动生成 128-bit 随机令牌（32 位小写十六进制），但线上只发送 nonce 与 HMAC-SHA256 证明，绝不发送原始令牌。Rust 端先证明，Android 使用 `MessageDigest.isEqual` 验证后才发送自身证明。认证连接可长期保持，但不会因此自动启动编码器。
 
 ### 2. 硬件限定的 MediaCodec H.264
 
@@ -122,8 +114,8 @@ Android 设置中新增“投屏桥接服务（RDP）”开关：
 - 视频队列饱和时清空整条预测链；
 - 丢弃后续 P 帧并请求新 IDR；
 - 只有收到 keyframe 后才恢复排队；
-- socket 写失败会关闭 accepted socket，解除 reader 阻塞；
-- 服务停止时同时关闭 listener 和已接受的 client socket。
+- 私有 bridge 写入失败会关闭当前 client fd，解除 reader 阻塞并进入重新连接；
+- 服务停止时会中断退避等待并关闭当前 client fd，不在 Android 侧保留 listener。
 
 ### 6. StreamStart / StreamStop 生命周期
 
@@ -234,7 +226,7 @@ app/build/outputs/apk/plain/debug/app-plain-debug.apk
 
 1. 安装 `app-plain-debug.apk`；
 2. 按原 anland 流程启动 daemon 与 ANiri producer；
-3. 在 Android consumer 设置中启用“投屏桥接服务（RDP）”；
+3. 在 Android consumer 设置中将“显示路由（RDP 桥接）”设为“远程”或“同时”；
 4. 复制显示的 32 位桥接令牌；
 5. 在 Arch 容器中配置并启动 `lamco-anland-bridge`；
 6. 在 Windows `mstsc` 中连接手机可达的 RDP 地址。
@@ -246,12 +238,11 @@ Rust 配置示例与 Windows 连接方法见：
 
 ## 安全边界
 
-- Android bridge 固定监听 `127.0.0.1:33910`；
-- service 为 non-exported；
-- 未认证连接不能发送输入、剪贴板或编码控制；
+- Android bridge 不监听 TCP；它作为客户端连接 root-owned、bind-mounted UDS `/data/local/tmp/anland-rdp/bridge.sock`；
+- service 为 non-exported，app 通过 root helper + `SCM_RIGHTS` 只取得已连接 fd；
+- HMAC 双向认证完成前不能发送输入、剪贴板或编码控制，原始 token 永不上线；
 - bridge token 不应公开、截图分享或写入公共配置；
-- 真正对 LAN 开放的是容器侧 RDP 端口，必须配置 TLS、用户名/密码和防火墙；
-- 本地 loopback 隔离效果依赖目标 Android/Droidspaces 网络实现，需在设备上验证。
+- 真正对 LAN 开放的是容器侧 RDP 端口，必须配置 TLS、用户名/密码和防火墙。
 
 ## 当前边界与验证状态
 
@@ -259,15 +250,15 @@ Rust 配置示例与 Windows 连接方法见：
 
 - Qualcomm/其他厂商硬件 H.264 codec 选择；
 - 隐藏 `ANativeWindow` API 与 MediaCodec Surface 的 dmabuf 导入；
-- Android 与 proot/Arch 是否共享 loopback；
-- 本地/远程 consumer 切换和 SurfaceView 恢复；
+- Droidspaces 对 `/data/local/tmp/anland-rdp` 的 bind mount、root helper 与 SELinux fd handoff；
+- local/remote/both 路由切换、SurfaceView 恢复，以及无 viewer 时停止 display consumer/MediaCodec 后的 bridge 重连；
 - 首次连接、重连、最小化恢复和 IDR；
 - CJK、emoji、空剪贴板双向同步；
 - 长时间运行的温度、功耗和稳定性。
 
-当前不支持：
+当前不支持或尚未完成设备验证：
 
-- 同时本地显示和远程编码；
+- 经目标设备验证的同时本地显示和远程编码（源码已实现能力门控，失败时明确回退 remote-direct）；
 - Android 全屏录制或 MediaProjection；
 - 软件 H.264 fallback；
 - 音频、文件、图片、HTML/RTF 的 RDP 传输。

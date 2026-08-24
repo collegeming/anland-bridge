@@ -62,12 +62,10 @@ public class SettingsActivity extends Activity {
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private static final String KEY_NOTIFICATION_ENABLED = "settings_notification";
-    // Bridge service: bridges this app's MediaCodec video + anland input to the
-    // lamco-anland-bridge RDP server so a PC can connect with mstsc. The service
-    // itself is started/stopped by the bridge module; this toggle only persists
-    // the user's intent and is read on app boot. Requires the companion project
-    // https://github.com/collegeming/lamco-anland-bridge on the container side.
-    private static final String KEY_BRIDGE_SERVICE_ENABLED = "bridge_service_enabled";
+    // The default display route. Stored as one of local / remote / both.
+    private static final DisplaySession.Mode[] BRIDGE_MODES = {
+            DisplaySession.Mode.LOCAL, DisplaySession.Mode.REMOTE, DisplaySession.Mode.BOTH
+    };
     private static final String KEY_ORIENTATION = "screen_orientation";
     private static final String[] ORIENTATION_VALUES = {"default", "landscape", "portrait"};
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
@@ -730,21 +728,31 @@ public class SettingsActivity extends Activity {
         header.setPadding(0, 0, 0, dp(8));
         root.addView(header);
 
-        Switch bridgeSwitch = new Switch(this);
-        bridgeSwitch.setText(R.string.bridge_service_switch);
-        bridgeSwitch.setTextSize(14);
-        bridgeSwitch.setPadding(0, dp(8), 0, 0);
-        bridgeSwitch.setChecked(prefs.getBoolean(KEY_BRIDGE_SERVICE_ENABLED, false));
-        bridgeSwitch.setOnCheckedChangeListener((v, checked) -> {
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putBoolean(KEY_BRIDGE_SERVICE_ENABLED, checked).apply();
-            BridgeService.setEnabled(this, checked);
-            String msg = checked
-                ? getString(R.string.bridge_service_enabled_toast)
-                : getString(R.string.bridge_service_disabled_toast);
-            Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+        TextView modeLabel = new TextView(this);
+        modeLabel.setText(R.string.bridge_mode_label);
+        modeLabel.setTextSize(14);
+        modeLabel.setPadding(0, dp(8), 0, dp(4));
+        root.addView(modeLabel);
+
+        Spinner modeSpinner = new Spinner(this);
+        modeSpinner.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item,
+                getResources().getStringArray(R.array.bridge_mode_options)));
+        DisplaySession.Mode currentMode = BridgeService.getMode(this);
+        modeSpinner.setSelection(currentMode.ordinal());
+        modeSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                DisplaySession.Mode selected = BRIDGE_MODES[position];
+                if (selected == BridgeService.getMode(SettingsActivity.this)) return;
+                BridgeService.setMode(SettingsActivity.this, selected);
+                Toast.makeText(SettingsActivity.this,
+                        getString(R.string.bridge_mode_changed_toast,
+                                parent.getItemAtPosition(position)), Toast.LENGTH_LONG).show();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
         });
-        root.addView(bridgeSwitch);
+        root.addView(modeSpinner);
 
         TextView token = new TextView(this);
         token.setText(getString(R.string.bridge_service_token,
@@ -1022,6 +1030,7 @@ public class SettingsActivity extends Activity {
         rootHint.setTextColor(Color.GRAY);
         rootHint.setPadding(0, dp(4), 0, 0);
         root.addView(rootHint);
+
 
         // Foreground scheduling (root). The selected scope mode is snapshotted
         // on connect so an active helper always has one consistent restore path.

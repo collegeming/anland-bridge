@@ -189,15 +189,20 @@
         <item>屏幕 × 0.25</item>
     </string-array>
 
-    <!-- 投屏桥接服务（RDP） -->
-    <string name="section_bridge_service">投屏桥接服务（RDP）</string>
-    <string name="bridge_service_switch">启用桥接服务</string>
-    <string name="bridge_service_hint">仅通过 Android 硬件 H.264 编码传输 anland 桌面，并转发 RDP 输入与剪贴板。容器侧 lamco-anland-bridge 需连接 tcp://127.0.0.1:33910。</string>
-    <string name="bridge_service_enabled_toast">桥接服务已启动，请在容器内运行 lamco-anland-bridge。</string>
-    <string name="bridge_service_disabled_toast">已关闭桥接服务。</string>
+    <!-- 默认显示路由与私有 RDP 桥接 -->
+    <string name="section_bridge_service">显示路由（RDP 桥接）</string>
+    <string name="bridge_mode_label">默认输出模式</string>
+    <string-array name="bridge_mode_options">
+        <item>本地</item>
+        <item>远程</item>
+        <item>同时</item>
+    </string-array>
+    <string name="bridge_mode_changed_toast">显示路由已切换为“%1$s”。</string>
+    <string name="bridge_service_hint">“本地”仅在本机显示桌面；“远程”在没有 RDP viewer 时保留本地画面，viewer 开始推流后切换到 Android 硬件 H.264；如果 viewer 和本地 Surface 都不存在，display consumer 与编码器会停止。“同时”保留本地画面与音频并尝试 GPU 分流。如果设备缺少所需 EGL 导入路径，该次推流会明确回退到仅远程直连。远程和同时模式会运行前台客户端，连接私有套接字 /data/local/tmp/anland-rdp/bridge.sock。</string>
     <string name="bridge_service_token">桥接令牌：%1$s</string>
     <string name="bridge_notification_channel">Anland RDP 桥接</string>
     <string name="bridge_notification_title">Anland RDP 桥接</string>
-    <string name="bridge_notification_waiting">正在等待本机 RDP 服务器</string>
-    <string name="bridge_notification_connected">正在硬件编码 anland 桌面</string>
+    <string name="bridge_notification_waiting">正在重连私有 Unix 套接字</string>
+    <string name="bridge_notification_connected">已认证，正在等待 RDP 推流</string>
+    <string name="bridge_notification_streaming">正在硬件编码 anland 桌面</string>
 </resources>

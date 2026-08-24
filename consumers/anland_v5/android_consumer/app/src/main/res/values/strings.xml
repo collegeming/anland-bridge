@@ -189,15 +189,20 @@
         <item>Screen × 0.25</item>
     </string-array>
 
-    <!-- Bridge Service (RDP screen-cast bridge) -->
-    <string name="section_bridge_service">Bridge Service (RDP Cast)</string>
-    <string name="bridge_service_switch">Enable bridge service</string>
-    <string name="bridge_service_hint">Streams only the anland desktop through Android hardware H.264 encoding and forwards RDP input and clipboard data. The companion lamco-anland-bridge server must connect to tcp://127.0.0.1:33910.</string>
-    <string name="bridge_service_enabled_toast">Bridge service started. Start lamco-anland-bridge in the container.</string>
-    <string name="bridge_service_disabled_toast">Bridge service disabled.</string>
+    <!-- Default display route and private RDP bridge -->
+    <string name="section_bridge_service">Display Route (RDP Bridge)</string>
+    <string name="bridge_mode_label">Default output mode</string>
+    <string-array name="bridge_mode_options">
+        <item>Local</item>
+        <item>Remote</item>
+        <item>Both</item>
+    </string-array>
+    <string name="bridge_mode_changed_toast">Display route changed to %1$s.</string>
+    <string name="bridge_service_hint">Local displays only on this device. Remote keeps the local view while no RDP viewer is active, then switches to Android hardware H.264; if neither a viewer nor local Surface exists, the display consumer and codec stop. Both keeps local display and audio while attempting GPU fan-out; if the required EGL import path is unavailable, that stream explicitly falls back to remote-direct. Remote and Both run a private foreground client for /data/local/tmp/anland-rdp/bridge.sock.</string>
     <string name="bridge_service_token">Bridge token: %1$s</string>
     <string name="bridge_notification_channel">Anland RDP bridge</string>
     <string name="bridge_notification_title">Anland RDP bridge</string>
-    <string name="bridge_notification_waiting">Waiting for the local RDP server</string>
-    <string name="bridge_notification_connected">Hardware-encoding the anland desktop</string>
+    <string name="bridge_notification_waiting">Reconnecting to the private Unix socket</string>
+    <string name="bridge_notification_connected">Authenticated; waiting for an RDP stream</string>
+    <string name="bridge_notification_streaming">Hardware-encoding the anland desktop</string>
 </resources>

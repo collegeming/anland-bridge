@@ -1,6 +1,7 @@
 #ifndef DISPLAY_CONSUMER_H
 #define DISPLAY_CONSUMER_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "../common/protocol.h"
 
@@ -20,6 +21,10 @@ int  poll_output_event_extend_data(display_ctx *ctx, void* payload, size_t size,
 int  set_exit_fallback_callback(display_ctx *ctx, void (*on_exit_fallback)(void *), void *userdata);
 int  get_data_fd(display_ctx *ctx);
 int  get_audio_fd(display_ctx *ctx);
+int  dup_audio_fd(display_ctx *ctx, uint64_t *generation);
+int  display_consumer_needs_reconnect(display_ctx *ctx);
+void display_consumer_fail_transport(display_ctx *ctx);
+void display_consumer_abort_io(display_ctx *ctx);
 void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event);
 
 
