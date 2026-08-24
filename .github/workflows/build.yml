@@ -250,13 +250,13 @@ jobs:
         run: |
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
-          test "$(git cat-file -t "refs/tags/$tag")" = tag
-          test "$(git rev-parse "$tag^{}")" = "$GITHUB_SHA"
-          tag_object="$(git rev-parse "refs/tags/$tag")"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.type)" = tag
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$tag_object"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.type)" = commit
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.sha)" = "$GITHUB_SHA"
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
+          test "$(jq -r .object.type <<< "$tag_ref")" = tag
+          tag_object="$(jq -r .object.sha <<< "$tag_ref")"
+          annotated_tag="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object")"
+          test "$(jq -r .object.type <<< "$annotated_tag")" = commit
+          test "$(jq -r .object.sha <<< "$annotated_tag")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Refuse an existing Release or assets
         run: |
