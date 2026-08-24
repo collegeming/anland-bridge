@@ -1,112 +1,385 @@
-name: Build APK and Daemon
+name: Build and release Anland Android bridge
 
 on:
   push:
-    branches: [ '**' ]
+    branches:
+      - bridge-service-toggle
+    tags:
+      - "anland-v*"
   workflow_dispatch:
 
+concurrency:
+  group: anland-android-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_API: "36"
+  BUILD_TOOLS_VERSION: "36.0.0"
+  NDK_VERSION: "29.0.13113456"
+  CMAKE_VERSION: "3.22.1"
+  FEATURE_BASELINE: "95b2d73ff799639ce8576ff908f13f5a31e024a1"
+  MAGISK_INSTALLER_COMMIT: "a19666d884768a3350dd70b8689da3b87e1d17b0"
+  MAGISK_INSTALLER_SHA256: "bcf4b1d9913f3af17755569c853e0b5a75b8005f6a18eb3f86dadcc0e968c29d"
+
 jobs:
-  build-apk:
+  build:
+    name: Build and verify Android packages
     runs-on: ubuntu-latest
-    strategy:
-      # One plain APK and one with the Tracy client enabled for profiling
-      # (product flavors in app/build.gradle; the tracy flavor also adds the
-      # INTERNET permission the Tracy listener needs). Tracy build clones the
-      # tag pinned in jni/CMakeLists.txt at configure time.
-      fail-fast: false
-      matrix:
-        include:
-          - task: assemblePlainRelease
-            name: anland-v5
-            apk: plain/release/app-plain-release.apk
-          - task: assembleTracyRelease
-            name: anland-v5-tracy
-            apk: tracy/release/app-tracy-release.apk
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # Full history so `git rev-list --count HEAD` yields the real commit
-          # count for versionCode (shallow checkout would make it always 1).
           fetch-depth: 0
+
+      - name: Verify source provenance
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$FEATURE_BASELINE" "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: "17"
 
-      - name: Setup Android SDK and NDK
-        uses: android-actions/setup-android@v4
+      - name: Set up Android SDK, NDK, and CMake
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
-          packages: "platform-tools build-tools;34.0.0 ndk;29.0.13113456"
+          packages: >-
+            platform-tools build-tools;${{ env.BUILD_TOOLS_VERSION }}
+            platforms;android-${{ env.ANDROID_API }}
+            ndk;${{ env.NDK_VERSION }} cmake;${{ env.CMAKE_VERSION }}
           accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
-      - name: Set NDK_DIR environment variable
-        run: echo "NDK_DIR=$ANDROID_HOME/ndk/29.0.13113456" >> $GITHUB_ENV
-
-      - name: Generate debug keystore
+      - name: Record Android tool paths
         run: |
-          mkdir -p $HOME/.android
-          keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
-            -storepass android -alias androiddebugkey -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug, O=Android, C=US" -noprompt
+          echo "NDK_DIR=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmake/$CMAKE_VERSION/bin" >> "$GITHUB_PATH"
 
-      - name: Build APK
+      - name: Generate ephemeral CI signing key
+        run: |
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -keystore "$HOME/.android/anland-ci.keystore" \
+            -storepass android -alias anlandci -keypass android \
+            -keyalg RSA -keysize 3072 -validity 3650 \
+            -dname "CN=Anland CI Release, O=Anland, C=US" -noprompt
+
+      - name: Clean, test, and build plain release APK
         working-directory: consumers/anland_v5/android_consumer
         run: |
+          set -o pipefail
           chmod +x gradlew
-          # Pass debug signing as project properties on the command line instead of
-          # appending to the tracked gradle.properties, which would dirty the working
-          # tree and make the git-derived versionName ("...-dirty") wrong on CI.
-          ./gradlew ${{ matrix.task }} \
-            -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+          ./gradlew --no-daemon clean testPlainDebugUnitTest assemblePlainRelease \
+            -Pandroid.injected.signing.store.file="$HOME/.android/anland-ci.keystore" \
             -Pandroid.injected.signing.store.password=android \
-            -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android
-          cp app/build/outputs/apk/${{ matrix.apk }} \
-             app/build/outputs/apk/${{ matrix.name }}.apk
+            -Pandroid.injected.signing.key.alias=anlandci \
+            -Pandroid.injected.signing.key.password=android \
+            2>&1 | tee "$RUNNER_TEMP/gradle-plain.log"
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.name }}
-          path: consumers/anland_v5/android_consumer/app/build/outputs/apk/${{ matrix.name }}.apk
-
-  build-daemon:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Setup Android SDK and NDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: "platform-tools build-tools;34.0.0 ndk;29.0.13113456"
-          accept-android-sdk-licenses: true
-
-      - name: Set NDK_DIR environment variable
-        run: echo "NDK_DIR=$ANDROID_HOME/ndk/29.0.13113456" >> $GITHUB_ENV
-
-      - name: Configure CMake for Android
+      - name: Stage plain APK and test result
         run: |
-          cmake -S . -B build_daemon_android \
-            -DCMAKE_TOOLCHAIN_FILE="$NDK_DIR/build/cmake/android.toolchain.cmake" \
+          set -euo pipefail
+          mkdir -p candidate
+          cp consumers/anland_v5/android_consumer/app/build/outputs/apk/plain/release/app-plain-release.apk \
+            candidate/app-plain-release.apk
+          result=EXECUTED
+          if grep -Eq ":app:testPlainDebugUnitTest NO-SOURCE" "$RUNNER_TEMP/gradle-plain.log"; then
+            result=NO-SOURCE
+          elif grep -Eq ":app:testPlainDebugUnitTest SKIPPED" "$RUNNER_TEMP/gradle-plain.log"; then
+            result=SKIPPED
+          fi
+          printf "%s\n" "$result" > candidate/plain-test-result.txt
+
+      - name: Clean and build Tracy profiling APK
+        working-directory: consumers/anland_v5/android_consumer
+        run: |
+          ./gradlew --no-daemon clean assembleTracyRelease \
+            -Pandroid.injected.signing.store.file="$HOME/.android/anland-ci.keystore" \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=anlandci \
+            -Pandroid.injected.signing.key.password=android
+
+      - name: Stage Tracy APK and license
+        run: |
+          set -euo pipefail
+          app=consumers/anland_v5/android_consumer/app
+          cp "$app/build/outputs/apk/tracy/release/app-tracy-release.apk" \
+            candidate/app-tracy-release.apk
+          tracy_license="$(find "$app/.cxx" -type f -path "*/tracy-src/LICENSE" -print -quit)"
+          test -n "$tracy_license"
+          cp "$tracy_license" candidate/TRACY-LICENSE
+
+      - name: Configure and build arm64 Android daemon
+        run: |
+          set -euo pipefail
+          cmake_bin="$ANDROID_HOME/cmake/$CMAKE_VERSION/bin/cmake"
+          "$cmake_bin" -S . -B build_daemon_android \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-30 \
             -DCMAKE_BUILD_TYPE=Release
+          "$cmake_bin" --build build_daemon_android --target display_daemon --parallel 2
+          file build_daemon_android/display_daemon | grep -Eq "ELF 64-bit.*ARM aarch64"
+          readelf -h build_daemon_android/display_daemon | grep -Eq "Machine:.*AArch64"
 
-      - name: Build display_daemon
-        run: cmake --build build_daemon_android --target display_daemon -j$(nproc)
-
-      - name: Copy daemon to magisk_module directory
+      - name: Build complete Magisk module ZIP
         run: |
-          cp build_daemon_android/display_daemon magisk_module/
-          chmod 755 magisk_module/display_daemon
+          set -euo pipefail
+          stage="$RUNNER_TEMP/anland-daemon"
+          mkdir -p "$stage/META-INF/com/google/android"
+          cp magisk_module/module.prop magisk_module/customize.sh \
+            magisk_module/service.sh magisk_module/sepolicy.rule "$stage/"
+          cp build_daemon_android/display_daemon "$stage/display_daemon"
+          chmod 755 "$stage/customize.sh" "$stage/service.sh" "$stage/display_daemon"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$stage/META-INF/com/google/android/update-binary" \
+            "https://raw.githubusercontent.com/topjohnwu/Magisk/$MAGISK_INSTALLER_COMMIT/scripts/module_installer.sh"
+          printf '%s  %s\n' "$MAGISK_INSTALLER_SHA256" \
+            "$stage/META-INF/com/google/android/update-binary" | sha256sum --check --strict
+          printf '#MAGISK\n' > "$stage/META-INF/com/google/android/updater-script"
+          chmod 755 "$stage/META-INF/com/google/android/update-binary"
+          version="candidate-${GITHUB_SHA:0:12}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#anland-v}"
+          fi
+          version_code="$(git rev-list --count HEAD)"
+          python3 - "$stage/module.prop" "$version" "$version_code" <<'PYMOD'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          lines = path.read_text(encoding="utf-8").splitlines()
+          values = {"version": sys.argv[2], "versionCode": sys.argv[3]}
+          output = []
+          for line in lines:
+              key = line.split("=", 1)[0]
+              output.append(f"{key}={values[key]}" if key in values else line)
+          path.write_text("\n".join(output) + "\n", encoding="utf-8")
+          PYMOD
+          (
+            cd "$stage"
+            zip -X -9 -r "$GITHUB_WORKSPACE/candidate/anland-daemon.zip" \
+              META-INF module.prop customize.sh service.sh sepolicy.rule display_daemon
+          )
 
-      - name: Upload Magisk module
-        uses: actions/upload-artifact@v7
+      - name: Verify APKs, arm64 JNI, and Magisk ZIP
+        run: |
+          set -euo pipefail
+          for apk in candidate/app-plain-release.apk candidate/app-tracy-release.apk; do
+            unzip -t "$apk"
+            "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/aapt2" dump badging "$apk" \
+              | grep -Fq "package: name='com.anland.consumer'"
+            "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner" verify --verbose "$apk"
+            mapfile -t native_entries < <(zipinfo -1 "$apk" | grep -E "^lib/arm64-v8a/.*[.]so$")
+            test "${#native_entries[@]}" -ge 3
+            zipinfo -1 "$apk" | grep -Fxq "lib/arm64-v8a/libanland_consumer.so"
+            zipinfo -1 "$apk" | grep -Fxq "lib/arm64-v8a/libfdhelper.so"
+            zipinfo -1 "$apk" | grep -Fxq "lib/arm64-v8a/libinputgrab.so"
+            if zipinfo -1 "$apk" | grep -E "^lib/" | grep -Ev "^lib/arm64-v8a/"; then
+              echo "Unexpected non-arm64 JNI entry in $apk" >&2
+              exit 1
+            fi
+            mkdir -p "$RUNNER_TEMP/native"
+            for entry in "${native_entries[@]}"; do
+              output="$RUNNER_TEMP/native/$(basename "$apk")-${entry##*/}"
+              unzip -p "$apk" "$entry" > "$output"
+              file "$output" | grep -Eq "ELF 64-bit.*ARM aarch64"
+              readelf -h "$output" | grep -Eq "Machine:.*AArch64"
+            done
+          done
+          unzip -t candidate/anland-daemon.zip
+          actual="$(unzip -Z1 candidate/anland-daemon.zip | grep -v '/$' | sort)"
+          expected="$(printf '%s\n' \
+            META-INF/com/google/android/update-binary \
+            META-INF/com/google/android/updater-script \
+            customize.sh display_daemon module.prop sepolicy.rule service.sh | sort)"
+          test "$actual" = "$expected"
+          test "$(unzip -p candidate/anland-daemon.zip META-INF/com/google/android/updater-script)" = '#MAGISK'
+          unzip -p candidate/anland-daemon.zip META-INF/com/google/android/update-binary \
+            > "$RUNNER_TEMP/module_installer.sh"
+          printf '%s  %s\n' "$MAGISK_INSTALLER_SHA256" "$RUNNER_TEMP/module_installer.sh" \
+            | sha256sum --check --strict
+          unzip -p candidate/anland-daemon.zip display_daemon > "$RUNNER_TEMP/display_daemon.from-zip"
+          cmp build_daemon_android/display_daemon "$RUNNER_TEMP/display_daemon.from-zip"
+          file "$RUNNER_TEMP/display_daemon.from-zip" | grep -Eq "ELF 64-bit.*ARM aarch64"
+          readelf -h "$RUNNER_TEMP/display_daemon.from-zip" | grep -Eq "Machine:.*AArch64"
+          unzip -p candidate/anland-daemon.zip module.prop | grep -Eq '^id=anland-daemon$'
+          unzip -p candidate/anland-daemon.zip service.sh | grep -Fq 'display_daemon'
+          (
+            cd candidate
+            sha256sum app-plain-release.apk app-tracy-release.apk anland-daemon.zip \
+              | sort -k2 > CANDIDATE-SHA256SUMS
+            sha256sum -c CANDIDATE-SHA256SUMS
+          )
+
+      - name: Upload verified candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: anland-daemon
-          path: magisk_module/
+          name: anland-android-candidate-${{ github.sha }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish immutable tagged Release
+    if: ${{ github.ref_type == 'tag' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Download verified candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: anland-android-candidate-${{ github.sha }}
+          path: candidate
+
+      - name: Verify annotated remote tag
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          test "$(git cat-file -t "refs/tags/$tag")" = tag
+          test "$(git rev-parse "$tag^{}")" = "$GITHUB_SHA"
+          tag_object="$(git rev-parse "refs/tags/$tag")"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.type)" = tag
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$tag_object"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.type)" = commit
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.sha)" = "$GITHUB_SHA"
+
+      - name: Refuse an existing Release or assets
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing Release or assets for $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Assemble final release assets
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#anland-v}"
+          plain="anland-bridge-$version-plain-release-arm64-v8a.apk"
+          tracy="anland-bridge-$version-tracy-profiling-release-arm64-v8a.apk"
+          mkdir -p release
+          cp candidate/app-plain-release.apk "release/$plain"
+          cp candidate/app-tracy-release.apk "release/$tracy"
+          cp candidate/anland-daemon.zip release/anland-daemon.zip
+          cp LICENSE release/LICENSE
+          test_result="$(cat candidate/plain-test-result.txt)"
+          cat > release/BUILD-METADATA.txt <<'END_META'
+          project=collegeming/anland-bridge
+          release_tag=TAG_VALUE
+          source_commit=SOURCE_VALUE
+          bridge_feature_baseline=95b2d73ff799639ce8576ff908f13f5a31e024a1
+          workflow_tooling_commit=SOURCE_VALUE
+          workflow_run=RUN_VALUE
+          android_application_id=com.anland.consumer
+          android_abi=arm64-v8a
+          android_compile_sdk=36
+          android_build_tools=36.0.0
+          android_ndk=29.0.13113456
+          cmake=3.22.1
+          magisk_installer_commit=a19666d884768a3350dd70b8689da3b87e1d17b0
+          magisk_installer_sha256=bcf4b1d9913f3af17755569c853e0b5a75b8005f6a18eb3f86dadcc0e968c29d
+          magisk_zip=Magisk-app installable and recovery-flashable
+          gradle=8.11.1
+          android_gradle_plugin=8.7.0
+          java=17
+          plain_gradle_command=clean testPlainDebugUnitTest assemblePlainRelease
+          plain_unit_test_result=TEST_VALUE
+          tracy_gradle_command=clean assembleTracyRelease
+          tracy_status=profiling-only
+          video_encoder=Android MediaCodec hardware H.264 only; no software fallback
+          deployment_boundary=Android host/root only; do not install these assets into Linux RootFS
+          apk_signing=ephemeral CI release key; uninstall incompatible prior signatures before installation
+          END_META
+          sed -i \
+            -e "s|TAG_VALUE|$tag|" \
+            -e "s|SOURCE_VALUE|$GITHUB_SHA|g" \
+            -e "s|RUN_VALUE|https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID|" \
+            -e "s|TEST_VALUE|$test_result|" release/BUILD-METADATA.txt
+          cat > release/THIRD-PARTY-NOTICES.txt <<'END_NOTICE'
+          Anland Android bridge third-party notices
+
+          This project is derived from superturtlee/anland and is distributed under
+          GNU GPL v3; see the accompanying LICENSE asset and source file headers.
+
+          The Tracy profiling APK only includes Tracy v0.14.0. Its license follows.
+
+          END_NOTICE
+          cat candidate/TRACY-LICENSE >> release/THIRD-PARTY-NOTICES.txt
+          {
+            printf 'Android-host assets built from annotated tag %s at commit %s.\n\n' "$tag" "$GITHUB_SHA"
+            printf -- '- Plain APK: `%s` for normal deployment.\n' "$plain"
+            printf -- '- Tracy APK: `%s`, profiling only, not the normal deployment build.\n' "$tracy"
+            printf -- '- Magisk module: `anland-daemon.zip`, complete arm64 module with Android display daemon.\n'
+            printf -- '- `SHA256SUMS`, `BUILD-METADATA.txt`, `LICENSE`, and `THIRD-PARTY-NOTICES.txt` authenticate and describe the build.\n\n'
+            printf '`testPlainDebugUnitTest` result: `%s`. `NO-SOURCE` means no Java unit tests existed; this Release does not claim otherwise.\n\n' "$test_result"
+            printf 'These assets belong on the Android host/root side only and must not be installed in the Linux RootFS. Video encoding is hardware MediaCodec H.264 only, with no software fallback.\n\n'
+            printf 'APKs use an ephemeral CI signing key. They are not upgrade-compatible with APKs signed by a different key.\n'
+          } > "$RUNNER_TEMP/release-notes.txt"
+          (
+            cd release
+            sha256sum "$plain" "$tracy" anland-daemon.zip BUILD-METADATA.txt \
+              LICENSE THIRD-PARTY-NOTICES.txt | sort -k2 > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          printf "%s\n" "$plain" "$tracy" anland-daemon.zip BUILD-METADATA.txt \
+            LICENSE SHA256SUMS THIRD-PARTY-NOTICES.txt | sort > "$RUNNER_TEMP/expected-assets"
+          find release -maxdepth 1 -type f -printf "%f\n" | sort > "$RUNNER_TEMP/actual-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/actual-assets"
+
+      - name: Create and independently verify draft Release
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          gh release create "$tag" release/* \
+            --draft \
+            --latest=false \
+            --notes-file "$RUNNER_TEMP/release-notes.txt" \
+            --title "Anland Android bridge ${tag#anland-v}" \
+            --verify-tag
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id)"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq .draft)" = true
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
+            --jq '.[].name' | sort > "$RUNNER_TEMP/remote-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/remote-assets"
+          mkdir -p "$RUNNER_TEMP/downloaded-release"
+          gh release download "$tag" --dir "$RUNNER_TEMP/downloaded-release"
+          find "$RUNNER_TEMP/downloaded-release" -maxdepth 1 -type f -printf "%f\n" \
+            | sort > "$RUNNER_TEMP/downloaded-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/downloaded-assets"
+          while IFS= read -r asset; do
+            cmp "release/$asset" "$RUNNER_TEMP/downloaded-release/$asset"
+          done < "$RUNNER_TEMP/expected-assets"
+          (
+            cd "$RUNNER_TEMP/downloaded-release"
+            sha256sum --check --strict SHA256SUMS
+          )
+          printf 'RELEASE_ID=%s\n' "$release_id" >> "$GITHUB_ENV"
+
+      - name: Publish immutable non-latest Release
+        run: |
+          set -euo pipefail
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest=false >/dev/null
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          test "$(jq -r .draft <<< "$release_json")" = false
+          test "$(jq -r .prerelease <<< "$release_json")" = false
+          test "$(jq -r .tag_name <<< "$release_json")" = "$GITHUB_REF_NAME"
+          test "$(jq -r '.assets | length' <<< "$release_json")" = 7
+          test "$(git rev-parse "$GITHUB_REF_NAME^{}")" = "$GITHUB_SHA"
+          printf 'Published %s\n' "$(jq -r .html_url <<< "$release_json")"
