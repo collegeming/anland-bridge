@@ -46,6 +46,8 @@ target_link_libraries(anland_consumer
     android
     log
     dl
+    EGL
+    GLESv2
     aaudio
     camera2ndk
     mediandk

@@ -14,6 +14,8 @@
 /* poll() timeout (ms) for the two reconnect handshake steps. Kept short so the
  * caller's reconnect loop stays responsive when no consumer is present yet. */
 #define HANDSHAKE_TIMEOUT_MS 100
+#define FRAME_IO_TIMEOUT_MS 1000
+#define STARTUP_TIMEOUT_MS 5000
 
 struct display_ctx {
     int      ctrl_fd;
@@ -87,32 +89,29 @@ static void enter_fallback(display_ctx *ctx)
 static int pickup_fds(display_ctx *ctx)
 {
     struct ctrl_msg hdr = { .type = CTRL_MSG_PICKUP_FDS, .size = 0 };
-    if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
-        return -1;
-
-    struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
-    if (poll(&pfd, 1, HANDSHAKE_TIMEOUT_MS) <= 0)
+    int64_t send_deadline = socket_deadline_after_ms(FRAME_IO_TIMEOUT_MS);
+    if (send_deadline < 0 ||
+        send_all_deadline(ctx->ctrl_fd, &hdr, sizeof(hdr), send_deadline) < 0)
         return -1;
 
     int fds[5];
     int fd_count = 0;
     struct ctrl_msg resp;
-    int n = recv_fds(ctx->ctrl_fd, &resp, sizeof(resp), fds, 5, &fd_count);
-    if (n < (int)sizeof(resp) || resp.type != CTRL_MSG_FDS_READY
-        || resp.size != 0 || fd_count != 5) {
+    int64_t deadline = socket_deadline_after_ms(HANDSHAKE_TIMEOUT_MS);
+    int n = deadline < 0 ? -1 : recv_fds_deadline(
+        ctx->ctrl_fd, &resp, sizeof(resp), fds, 5, &fd_count, deadline);
+    if (n != (int)sizeof(resp) || resp.type != CTRL_MSG_FDS_READY ||
+        resp.size != 0 || fd_count != 5) {
         for (int i = 0; i < fd_count; i++)
             close(fds[i]);
         return -1;
     }
 
-    /* Slot order matches the consumer's send_hello_fds(): { buf_ready, fence, data, shm, audio }.
-     * fence_fd is the write end of the dedicated producer->consumer render-done channel;
-     * audio_fd is the full-duplex PCM socket (producer writes playback, reads mic). */
-    ctx->buf_ready_efd    = fds[0];
-    ctx->fence_fd         = fds[1];
-    ctx->data_fd          = fds[2];
-    ctx->shm_fd           = fds[3];
-    ctx->audio_fd         = fds[4];
+    ctx->buf_ready_efd = fds[0];
+    ctx->fence_fd = fds[1];
+    ctx->data_fd = fds[2];
+    ctx->shm_fd = fds[3];
+    ctx->audio_fd = fds[4];
 
     ctx->shm_ptr = mmap(NULL, sizeof(uint32_t), PROT_READ, MAP_SHARED, ctx->shm_fd, 0);
     if (ctx->shm_ptr == MAP_FAILED) {
@@ -132,44 +131,30 @@ static int receive_dmabufs(display_ctx *ctx)
     if (ctx->buf_count > 0)
         return 0;
 
-    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN | POLLHUP | POLLERR };
-    if (poll(&pfd, 1, HANDSHAKE_TIMEOUT_MS) <= 0)
-        return -1;
-    if (pfd.revents & (POLLHUP | POLLERR))
-        return -1;
-
-    struct data_msg dhdr;
+    struct data_msg hdr;
     int fds[MAX_BUFS];
     int fd_count = 0;
-
-    int n = recv_fds(ctx->data_fd, &dhdr, sizeof(dhdr), fds, MAX_BUFS, &fd_count);
-    if (n < (int)sizeof(struct data_msg) || fd_count < 1) {
+    int64_t deadline = socket_deadline_after_ms(HANDSHAKE_TIMEOUT_MS);
+    int n = deadline < 0 ? -1 : recv_fds_deadline(
+        ctx->data_fd, &hdr, sizeof(hdr), fds, MAX_BUFS, &fd_count, deadline);
+    if (n != (int)sizeof(hdr) || fd_count < 1 ||
+        hdr.type != DATA_MSG_BUFS_READY || hdr.size == 0 ||
+        hdr.size % sizeof(struct buf_info) != 0 ||
+        hdr.size > MAX_BUFS * sizeof(struct buf_info)) {
         for (int i = 0; i < fd_count; i++)
             close(fds[i]);
         return -1;
     }
 
-    if (dhdr.type != DATA_MSG_BUFS_READY) {
-        for (int i = 0; i < fd_count; i++)
-            close(fds[i]);
-        return -1;
-    }
-
-    if (dhdr.size == 0 || dhdr.size % sizeof(struct buf_info) != 0) {
-        for (int i = 0; i < fd_count; i++)
-            close(fds[i]);
-        return -1;
-    }
-
-    int count = dhdr.size / sizeof(struct buf_info);
-    if (count != fd_count || count > MAX_BUFS) {
+    int count = (int)(hdr.size / sizeof(struct buf_info));
+    if (count != fd_count) {
         for (int i = 0; i < fd_count; i++)
             close(fds[i]);
         return -1;
     }
 
     struct buf_info infos[MAX_BUFS];
-    if (recv_all(ctx->data_fd, infos, dhdr.size) < 0) {
+    if (recv_all_deadline(ctx->data_fd, infos, hdr.size, deadline) < 0) {
         for (int i = 0; i < fd_count; i++)
             close(fds[i]);
         return -1;
@@ -197,7 +182,7 @@ int connect_to_deamon(display_ctx **out, const char *socket_path)
     ctx->audio_fd = -1;
     ctx->pending_render_fence = -1;
     ctx->shm_ptr = NULL;
-    ctx->fallback = true; // stay in fallback until try_exit_fallback() succeeds
+    ctx->fallback = true;
     for (int i = 0; i < MAX_BUFS; i++)
         ctx->dmabuf_fds[i] = -1;
 
@@ -206,11 +191,13 @@ int connect_to_deamon(display_ctx **out, const char *socket_path)
         goto fail;
 
     struct ctrl_msg hdr = { .type = CTRL_MSG_PRODUCER_HELLO, .size = 0 };
-    if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
+    int64_t deadline = socket_deadline_after_ms(STARTUP_TIMEOUT_MS);
+    if (deadline < 0 ||
+        send_all_deadline(ctx->ctrl_fd, &hdr, sizeof(hdr), deadline) < 0)
         goto fail;
 
     uint8_t buf[sizeof(struct ctrl_msg) + sizeof(struct screen_info)];
-    if (recv_all(ctx->ctrl_fd, buf, sizeof(buf)) < 0)
+    if (recv_all_deadline(ctx->ctrl_fd, buf, sizeof(buf), deadline) < 0)
         goto fail;
 
     struct ctrl_msg resp;
@@ -218,16 +205,13 @@ int connect_to_deamon(display_ctx **out, const char *socket_path)
     if (resp.type != CTRL_MSG_SCREEN_INFO || resp.size != sizeof(struct screen_info))
         goto fail;
 
-    struct screen_info si;
-    memcpy(&si, buf + sizeof(struct ctrl_msg), sizeof(si));
-    ctx->screen_w = si.width;
-    ctx->screen_h = si.height;
-    ctx->pixel_format = si.format;
-    ctx->refresh = si.refresh;
+    struct screen_info info;
+    memcpy(&info, buf + sizeof(struct ctrl_msg), sizeof(info));
+    ctx->screen_w = info.width;
+    ctx->screen_h = info.height;
+    ctx->pixel_format = info.format;
+    ctx->refresh = info.refresh;
 
-    // Daemon handshake only: screen info is in hand, but the consumer fds and
-    // dmabufs are deliberately left for try_exit_fallback() so the backend brings
-    // the consumer up through the single reconnect path. Stay in fallback.
     *out = ctx;
     return 0;
 
@@ -300,7 +284,7 @@ int trigger_refresh(display_ctx *ctx)
         c->cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(c), &ctx->pending_render_fence, sizeof(int));
     }
-    const ssize_t sent = sendmsg(ctx->fence_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    ssize_t sent = sendmsg(ctx->fence_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
     if (ctx->pending_render_fence >= 0) {
         close(ctx->pending_render_fence);
         ctx->pending_render_fence = -1;
@@ -319,28 +303,35 @@ int poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms)
 
     struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
     int ret = poll(&pfd, 1, timeout_ms);
-    if (ret <= 0)
+    if (ret == 0)
         return 0;
-
-    if (pfd.revents & (POLLHUP | POLLERR)) {
+    if (ret < 0) {
+        if (errno == EINTR)
+            return 0;
         enter_fallback(ctx);
         return -1;
     }
-
-    uint8_t msg_buf[sizeof(struct data_msg) + sizeof(struct InputEvent)];
-    ssize_t n = recv(ctx->data_fd, msg_buf, sizeof(msg_buf), MSG_PEEK);
-    if (n < (ssize_t)sizeof(struct data_msg))
-        return 0;
-
-    struct data_msg hdr;
-    memcpy(&hdr, msg_buf, sizeof(hdr));
-    if (hdr.type != DATA_MSG_INPUT_EVENT)
-        return 0;
-
-    if (recv_all(ctx->data_fd, msg_buf, sizeof(struct data_msg) + sizeof(struct InputEvent)) < 0)
+    if (pfd.revents & (POLLERR | POLLNVAL)) {
+        enter_fallback(ctx);
         return -1;
+    }
+    if (!(pfd.revents & POLLIN)) {
+        if (pfd.revents & POLLHUP) {
+            enter_fallback(ctx);
+            return -1;
+        }
+        return 0;
+    }
 
-    memcpy(event, msg_buf + sizeof(struct data_msg), sizeof(*event));
+    int64_t deadline = socket_deadline_after_ms(FRAME_IO_TIMEOUT_MS);
+    struct data_msg hdr;
+    if (deadline < 0 ||
+        recv_all_deadline(ctx->data_fd, &hdr, sizeof(hdr), deadline) < 0 ||
+        hdr.type != DATA_MSG_INPUT_EVENT || hdr.size != sizeof(struct InputEvent) ||
+        recv_all_deadline(ctx->data_fd, event, sizeof(*event), deadline) < 0) {
+        enter_fallback(ctx);
+        return -1;
+    }
     return 1;
 }
 
@@ -350,28 +341,21 @@ int poll_input_event_extend_fds(display_ctx *ctx, int *fds, int max_fds,
     *fd_count = 0;
     if (ctx->fallback)
         return 0;
-
-    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
-    int ret = poll(&pfd, 1, timeout_ms);
-    if (ret <= 0)
-        return 0;
-
-    if (pfd.revents & (POLLHUP | POLLERR)) {
+    if (!fds || max_fds <= 0) {
         enter_fallback(ctx);
         return -1;
     }
 
-    struct data_msg hdr;
     int got = 0;
-    int n = recv_fds(ctx->data_fd, &hdr, sizeof(hdr), fds, max_fds, &got);
-    if (n < (int)sizeof(struct data_msg)) {
+    struct data_msg hdr;
+    int64_t deadline = socket_deadline_after_ms(timeout_ms);
+    int n = deadline < 0 ? -1 : recv_fds_deadline(
+        ctx->data_fd, &hdr, sizeof(hdr), fds, max_fds, &got, deadline);
+    if (n != (int)sizeof(hdr) || got < 1 ||
+        hdr.type != DATA_MSG_INPUT_EXTEND_FDS || hdr.size != 0) {
         for (int i = 0; i < got; i++)
             close(fds[i]);
-        return -1;
-    }
-    if (hdr.type != DATA_MSG_INPUT_EXTEND_FDS) {
-        for (int i = 0; i < got; i++)
-            close(fds[i]);
+        enter_fallback(ctx);
         return -1;
     }
     *fd_count = got;
@@ -402,30 +386,37 @@ int push_output_event(display_ctx *ctx, const struct OutputEvent *event)
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), event, sizeof(*event));
 
-    if (send_all(ctx->data_fd, msg, sizeof(msg)) < 0) {
+    int64_t deadline = socket_deadline_after_ms(FRAME_IO_TIMEOUT_MS);
+    if (deadline < 0 ||
+        send_all_deadline(ctx->data_fd, msg, sizeof(msg), deadline) < 0) {
         enter_fallback(ctx);
         return -1;
     }
     return 0;
 }
 
-int push_output_event_with_length(display_ctx *ctx, const struct OutputEvent *event, void *payload, size_t size)
+int push_output_event_with_length(display_ctx *ctx, const struct OutputEvent *event,
+                                  void *payload, size_t size)
 {
     if (ctx->fallback)
         return 0;
-
-    struct data_msg hdr = { .type = DATA_MSG_OUTPUT_EVENT, .size = sizeof(struct OutputEvent) };
-    const size_t msg_size = sizeof(struct data_msg) + sizeof(struct OutputEvent) + size;
-    uint8_t *msg = malloc(msg_size);
-    if (!msg)
+    if ((size > 0 && !payload) ||
+        size > SIZE_MAX - sizeof(struct data_msg) - sizeof(struct OutputEvent))
         return -1;
 
+    struct data_msg hdr = { .type = DATA_MSG_OUTPUT_EVENT, .size = sizeof(struct OutputEvent) };
+    size_t total = sizeof(struct data_msg) + sizeof(struct OutputEvent) + size;
+    uint8_t *msg = malloc(total);
+    if (!msg)
+        return -1;
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), event, sizeof(*event));
     if (size > 0)
         memcpy(msg + sizeof(hdr) + sizeof(struct OutputEvent), payload, size);
 
-    if (send_all(ctx->data_fd, msg, msg_size) < 0) {
+    int64_t deadline = socket_deadline_after_ms(FRAME_IO_TIMEOUT_MS);
+    if (deadline < 0 ||
+        send_all_deadline(ctx->data_fd, msg, total, deadline) < 0) {
         free(msg);
         enter_fallback(ctx);
         return -1;
@@ -434,22 +425,24 @@ int push_output_event_with_length(display_ctx *ctx, const struct OutputEvent *ev
     return 0;
 }
 
-int poll_input_event_extend_data(display_ctx *ctx, void *payload, size_t size, int timeout_ms)
+int poll_input_event_extend_data(display_ctx *ctx, void *payload, size_t size,
+                                 int timeout_ms)
 {
     if (ctx->fallback)
         return 0;
-
-    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
-    int ret = poll(&pfd, 1, timeout_ms);
-    if (ret <= 0)
-        return 0;
-
-    if (pfd.revents & (POLLHUP | POLLERR)) {
+    if (size == 0)
+        return 1;
+    if (!payload) {
         enter_fallback(ctx);
         return -1;
     }
-    if (recv_all(ctx->data_fd, payload, size) < 0)
+
+    int64_t deadline = socket_deadline_after_ms(timeout_ms);
+    if (deadline < 0 ||
+        recv_all_deadline(ctx->data_fd, payload, size, deadline) < 0) {
+        enter_fallback(ctx);
         return -1;
+    }
     return 1;
 }
 

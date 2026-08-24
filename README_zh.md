@@ -10,6 +10,14 @@
 
 > [English](README.md)
 
+## Android RDP 桥接补充
+
+Android v5 consumer 的默认输出模式为 `local`、`remote`、`both` 三态；旧布尔设置只迁移一次（`false` → `local`，`true` → `remote`）。`remote`/`both` 启动 non-exported 前台服务，Android 作为重连客户端，通过 root fd helper 与 `SCM_RIGHTS` 连接 Droidspaces bind-mounted UDS `/data/local/tmp/anland-rdp/bridge.sock`，不监听 TCP，也不向普通应用暴露 root socket。
+
+桥接认证版本为 v1：双方各生成 32 字节 nonce，以解码后的 16 字节 token 派生 HMAC-SHA256 session key；Rust 先证明，Android 用 `MessageDigest.isEqual` 验证后才发送证明，原始 token 永不上线。剪贴板上限 1 MiB，采用严格 UTF-8、拒绝内嵌 NUL，零长度表示清空，并带 64 位 sequence/ACK。
+
+显示路由为：无流的 `local` 使用 SurfaceView 直出；有流的 `remote` 使用 MediaCodec 直出；`both` 有本地 Surface 时使用已实现的三槽 EGL/GLES GPU fan-out，无本地 Surface 的活动流使用 MediaCodec 直出，空闲且无本地 Surface 时停止 display consumer/MediaCodec；`STREAM_STOP` 销毁 codec，并在有本地 Surface 时恢复本地直出。fan-out 的 EGL/native-buffer 预检或运行时失败会明确报告并回退 remote-direct，因此同时本地画面和远程编码仍需目标设备验证。`local` 与 `both` 保留本机音频；纯 `remote` 继续不启用本机音频策略。当前文档不声称已完成目标设备运行时验证。
+
 ---
 
 ## 1. 角色

@@ -136,9 +136,8 @@ public class KeyInterceptor extends AccessibilityService {
     public void onInterrupt() {}
 
     private static MainActivity getMainActivity() {
-        // MainActivity is the only activity; we can locate it via the global
-        // reference set in onCreate. Since we don't have a static getInstance()
-        // on MainActivity, we use the singleton from the launcher's assumption.
-        return MainActivity.sInstance;
+        // Accessibility input follows the currently focused anland window. The
+        // reference is cleared on destroy so a dead Activity is never retained.
+        return MainActivity.focusedInstance();
     }
 }

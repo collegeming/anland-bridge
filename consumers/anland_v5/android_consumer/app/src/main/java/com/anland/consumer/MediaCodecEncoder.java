@@ -5,6 +5,8 @@ import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.media.MediaCodecList;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.Surface;
 
@@ -15,7 +17,7 @@ import java.util.Arrays;
 
 final class MediaCodecEncoder implements AutoCloseable {
     interface FrameSink {
-        void onFrame(byte[] annexB, long timestampMs, boolean keyFrame) throws IOException;
+        boolean onFrame(byte[] annexB, long timestampMs, boolean keyFrame) throws IOException;
     }
 
     private static final String TAG = "AnlandEncoder";
@@ -23,47 +25,48 @@ final class MediaCodecEncoder implements AutoCloseable {
     private static final int DEQUEUE_TIMEOUT_US = 10_000;
 
     private final MediaCodec codec;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Surface inputSurface;
     private final FrameSink sink;
+    private final Runnable failureHandler;
     private final Thread outputThread;
     private volatile boolean running = true;
+    private boolean codecStopped;
+    private boolean released;
     private byte[] codecConfig = new byte[0];
     private final ByteArrayOutputStream partialAccessUnit = new ByteArrayOutputStream();
     private int partialFlags;
     private long partialPresentationTimeUs;
 
-    MediaCodecEncoder(int width, int height, int fps, int bitRate, FrameSink sink)
-            throws IOException {
+    MediaCodecEncoder(int width, int height, int fps, int bitRate, FrameSink sink,
+                      Runnable failureHandler) throws IOException {
         this.sink = sink;
+        this.failureHandler = failureHandler;
         EncoderSelection selection = findHardwareEncoder(width, height, fps);
         if (selection == null) {
             throw new IOException("No compatible hardware H.264 Surface encoder is available");
         }
-        codec = MediaCodec.createByCodecName(selection.codecName);
-
         int selectedBitRate = Math.max(selection.minBitRate,
                 Math.min(selection.maxBitRate, bitRate));
-        MediaFormat format = MediaFormat.createVideoFormat(MIME, width, height);
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, selectedBitRate);
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
-        format.setInteger(MediaFormat.KEY_BITRATE_MODE, selection.bitRateMode);
-        if (selection.supportsMainProfile) {
-            format.setInteger(MediaFormat.KEY_PROFILE,
-                    MediaCodecInfo.CodecProfileLevel.AVCProfileMain);
-        }
-        format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
-
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-        inputSurface = codec.createInputSurface();
-        codec.start();
+        InitializedCodec initialized = initializeCodec(selection, width, height, fps,
+                selectedBitRate);
+        codec = initialized.codec;
+        inputSurface = initialized.surface;
 
         outputThread = new Thread(this::drainOutput, "anland-codec-output");
         outputThread.start();
         Log.i(TAG, "Started " + codec.getName() + " at " + width + "x" + height
                 + " " + fps + "fps " + selectedBitRate + "bps");
+    }
+
+    private static final class InitializedCodec {
+        final MediaCodec codec;
+        final Surface surface;
+
+        InitializedCodec(MediaCodec codec, Surface surface) {
+            this.codec = codec;
+            this.surface = surface;
+        }
     }
 
     private static final class EncoderSelection {
@@ -80,6 +83,39 @@ final class MediaCodecEncoder implements AutoCloseable {
             this.supportsMainProfile = supportsMainProfile;
             this.minBitRate = minBitRate;
             this.maxBitRate = maxBitRate;
+        }
+    }
+
+    private static InitializedCodec initializeCodec(EncoderSelection selection,
+                                                     int width, int height, int fps,
+                                                     int bitRate) throws IOException {
+        MediaCodec codec = MediaCodec.createByCodecName(selection.codecName);
+        Surface surface = null;
+        boolean started = false;
+        try {
+            MediaFormat format = MediaFormat.createVideoFormat(MIME, width, height);
+            format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
+            format.setInteger(MediaFormat.KEY_BITRATE_MODE, selection.bitRateMode);
+            if (selection.supportsMainProfile) {
+                format.setInteger(MediaFormat.KEY_PROFILE,
+                        MediaCodecInfo.CodecProfileLevel.AVCProfileMain);
+            }
+            format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
+
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            surface = codec.createInputSurface();
+            codec.start();
+            started = true;
+            return new InitializedCodec(codec, surface);
+        } finally {
+            if (!started) {
+                if (surface != null) surface.release();
+                codec.release();
+            }
         }
     }
 
@@ -192,7 +228,10 @@ final class MediaCodecEncoder implements AutoCloseable {
                 }
             }
         } catch (Exception e) {
-            if (running) Log.e(TAG, "Encoder output failed", e);
+            if (running) {
+                Log.e(TAG, "Encoder output failed", e);
+                if (failureHandler != null) mainHandler.post(failureHandler);
+            }
         }
     }
 
@@ -210,7 +249,7 @@ final class MediaCodecEncoder implements AutoCloseable {
             System.arraycopy(annexB, 0, withConfig, codecConfig.length, annexB.length);
             annexB = withConfig;
         }
-        sink.onFrame(annexB, presentationTimeUs / 1000L, keyFrame);
+        if (sink.onFrame(annexB, presentationTimeUs / 1000L, keyFrame)) requestIdr();
     }
 
     private void updateCodecConfig(MediaFormat format) {
@@ -269,19 +308,36 @@ final class MediaCodecEncoder implements AutoCloseable {
         return false;
     }
 
-    @Override
-    public void close() {
+    synchronized void beginClose() {
+        if (codecStopped) return;
         running = false;
-        try {
-            outputThread.join(1000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        codecStopped = true;
         try {
             codec.stop();
         } catch (IllegalStateException ignored) {
         }
+    }
+
+    synchronized void finishClose() {
+        if (released) return;
+        beginClose();
+        boolean interrupted = false;
+        while (outputThread.isAlive()) {
+            try {
+                outputThread.join();
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
         inputSurface.release();
         codec.release();
+        released = true;
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    @Override
+    public void close() {
+        beginClose();
+        finishClose();
     }
 }

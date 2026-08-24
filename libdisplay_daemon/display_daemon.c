@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -16,6 +19,7 @@
 /* Hello fd set: { buf_ready, fence, data, shm, audio }. The daemon only relays
  * the fds; it never interprets the slots. */
 #define MAX_FDS    5
+#define CTRL_IO_TIMEOUT_MS 1000
 
 struct client {
     int  ctrl_fd;
@@ -51,18 +55,27 @@ static void client_free(daemon_ctx *ctx, struct client *c)
     free(c);
 }
 
+static void close_fd_array(int *fds, int count)
+{
+    for (int i = 0; i < count; i++)
+        close(fds[i]);
+}
+
 static void clear_deposited_fds(daemon_ctx *ctx)
 {
-    for (int i = 0; i < ctx->deposited_fd_count; i++)
-        close(ctx->deposited_fds[i]);
+    close_fd_array(ctx->deposited_fds, ctx->deposited_fd_count);
     ctx->deposited_fd_count = 0;
 }
 
 static int send_ctrl(int fd, uint32_t type)
 {
     struct ctrl_msg msg = { .type = type, .size = 0 };
-    return send_all(fd, &msg, sizeof(msg));
+    int64_t deadline = socket_deadline_after_ms(CTRL_IO_TIMEOUT_MS);
+    return deadline < 0 ? -1 :
+           send_all_deadline(fd, &msg, sizeof(msg), deadline);
 }
+
+static void drop_client(daemon_ctx *ctx, struct client *c);
 
 static int send_screen_info_msg(daemon_ctx *ctx, int fd)
 {
@@ -70,33 +83,39 @@ static int send_screen_info_msg(daemon_ctx *ctx, int fd)
     uint8_t buf[sizeof(struct ctrl_msg) + sizeof(struct screen_info)];
     memcpy(buf, &hdr, sizeof(hdr));
     memcpy(buf + sizeof(hdr), &ctx->stored_screen, sizeof(ctx->stored_screen));
-    return send_all(fd, buf, sizeof(buf));
+    int64_t deadline = socket_deadline_after_ms(CTRL_IO_TIMEOUT_MS);
+    return deadline < 0 ? -1 : send_all_deadline(fd, buf, sizeof(buf), deadline);
 }
 
-static void try_deliver_fds(daemon_ctx *ctx)
+static bool try_deliver_fds(daemon_ctx *ctx)
 {
-    if (!ctx->producer || ctx->deposited_fd_count < MAX_FDS) {
+    if (!ctx->producer || !ctx->consumer || ctx->deposited_fd_count != MAX_FDS) {
         ctx->producer_waiting_fds = true;
-        return;
+        return true;
     }
 
+    struct client *producer = ctx->producer;
+    struct client *consumer = ctx->consumer;
     struct ctrl_msg msg = { .type = CTRL_MSG_FDS_READY, .size = 0 };
-    if (send_fds(ctx->producer->ctrl_fd, &msg, sizeof(msg),
-                 ctx->deposited_fds, ctx->deposited_fd_count) < 0) {
-        fprintf(stderr, "daemon: failed to send fds to producer\n");
-        ctx->producer_waiting_fds = true;
-        return;
+    int64_t deadline = socket_deadline_after_ms(CTRL_IO_TIMEOUT_MS);
+    bool delivered = deadline >= 0 && send_fds_deadline(
+        producer->ctrl_fd, &msg, sizeof(msg), ctx->deposited_fds,
+        ctx->deposited_fd_count, deadline) == 0;
+    bool acknowledged = delivered &&
+        send_ctrl(consumer->ctrl_fd, CTRL_MSG_FDS_READY) == 0;
+    if (!acknowledged) {
+        fprintf(stderr, "daemon: fd delivery failed; resetting both peers\n");
+        if (ctx->producer == producer)
+            drop_client(ctx, producer);
+        if (ctx->consumer == consumer)
+            drop_client(ctx, consumer);
+        return false;
     }
 
-    if (ctx->consumer)
-        send_ctrl(ctx->consumer->ctrl_fd, CTRL_MSG_FDS_READY);
-
-    for (int i = 0; i < ctx->deposited_fd_count; i++)
-        close(ctx->deposited_fds[i]);
-    ctx->deposited_fd_count = 0;
+    clear_deposited_fds(ctx);
     ctx->producer_waiting_fds = false;
-
     fprintf(stderr, "daemon: fds delivered to producer\n");
+    return true;
 }
 
 /*
@@ -134,34 +153,43 @@ static void handle_client_data(daemon_ctx *ctx, struct client *c)
     int fds[MAX_FDS];
     int fd_count = 0;
 
-    int n = recv_fds(c->ctrl_fd, &hdr, sizeof(hdr), fds, MAX_FDS, &fd_count);
-    if (n <= 0) {
+    int64_t deadline = socket_deadline_after_ms(CTRL_IO_TIMEOUT_MS);
+    int n = deadline < 0 ? -1 : recv_fds_deadline(
+        c->ctrl_fd, &hdr, sizeof(hdr), fds, MAX_FDS, &fd_count, deadline);
+    if (n != (int)sizeof(hdr)) {
         drop_client(ctx, c);
         return;
     }
 
     uint8_t payload[sizeof(struct screen_info)];
-    if (hdr.size > 0) {
-        if (hdr.size > sizeof(payload) || recv_all(c->ctrl_fd, payload, hdr.size) < 0) {
-            drop_client(ctx, c);
-            return;
-        }
+    if (hdr.size > sizeof(payload) ||
+        (hdr.size > 0 && recv_all_deadline(
+            c->ctrl_fd, payload, hdr.size, deadline) < 0)) {
+        close_fd_array(fds, fd_count);
+        drop_client(ctx, c);
+        return;
     }
 
+    bool accepted_fds = false;
+    bool valid = true;
     switch (hdr.type) {
     case CTRL_MSG_CONSUMER_HELLO:
-        if (c == ctx->consumer && fd_count >= MAX_FDS - 1) {
+        valid = c == ctx->consumer && hdr.size == 0 && fd_count == MAX_FDS;
+        if (valid) {
             clear_deposited_fds(ctx);
             memcpy(ctx->deposited_fds, fds, sizeof(int) * fd_count);
             ctx->deposited_fd_count = fd_count;
+            accepted_fds = true;
             fprintf(stderr, "daemon: consumer re-deposited %d fds\n", fd_count);
-            if (ctx->producer_waiting_fds)
-                try_deliver_fds(ctx);
+            if (ctx->producer_waiting_fds && !try_deliver_fds(ctx))
+                return;
         }
         break;
 
     case CTRL_MSG_SCREEN_INFO:
-        if (c == ctx->consumer && hdr.size == sizeof(struct screen_info)) {
+        valid = c == ctx->consumer && hdr.size == sizeof(struct screen_info) &&
+                fd_count == 0;
+        if (valid) {
             struct screen_info si;
             memcpy(&si, payload, sizeof(si));
             /* Always accept the consumer's screen info, even if it differs from a
@@ -172,46 +200,64 @@ static void handle_client_data(daemon_ctx *ctx, struct client *c)
             fprintf(stderr, "daemon: screen info %ux%u fmt=%u\n",
                     si.width, si.height, si.format);
             if (ctx->producer_waiting_screen && ctx->producer) {
-                send_screen_info_msg(ctx, ctx->producer->ctrl_fd);
-                ctx->producer_waiting_screen = false;
+                struct client *producer = ctx->producer;
+                if (send_screen_info_msg(ctx, producer->ctrl_fd) < 0)
+                    drop_client(ctx, producer);
+                else
+                    ctx->producer_waiting_screen = false;
             }
         }
         break;
 
     case CTRL_MSG_PICKUP_FDS:
-        if (c == ctx->producer)
-            try_deliver_fds(ctx);
+        valid = c == ctx->producer && hdr.size == 0 && fd_count == 0;
+        if (valid && !try_deliver_fds(ctx))
+            return;
         break;
 
     default:
+        valid = false;
         break;
     }
+    if (!accepted_fds)
+        close_fd_array(fds, fd_count);
+    if (!valid)
+        drop_client(ctx, c);
 }
 
 static void handle_new_connection(daemon_ctx *ctx, int listen_fd)
 {
-    int client_fd = accept(listen_fd, NULL, NULL);
+    int client_fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (client_fd < 0)
         return;
 
     struct ctrl_msg hdr;
     int fds[MAX_FDS];
     int fd_count = 0;
-
-    int n = recv_fds(client_fd, &hdr, sizeof(hdr), fds, MAX_FDS, &fd_count);
-    if (n < (int)sizeof(struct ctrl_msg)) {
+    int64_t deadline = socket_deadline_after_ms(CTRL_IO_TIMEOUT_MS);
+    int n = deadline < 0 ? -1 : recv_fds_deadline(
+        client_fd, &hdr, sizeof(hdr), fds, MAX_FDS, &fd_count, deadline);
+    bool consumer_hello = n == (int)sizeof(hdr) &&
+                          hdr.type == CTRL_MSG_CONSUMER_HELLO && hdr.size == 0 &&
+                          fd_count == MAX_FDS;
+    bool producer_hello = n == (int)sizeof(hdr) &&
+                          hdr.type == CTRL_MSG_PRODUCER_HELLO && hdr.size == 0 &&
+                          fd_count == 0;
+    if (!consumer_hello && !producer_hello) {
+        close_fd_array(fds, fd_count);
         close(client_fd);
         return;
     }
 
     struct client *c = calloc(1, sizeof(*c));
     if (!c) {
+        close_fd_array(fds, fd_count);
         close(client_fd);
         return;
     }
     c->ctrl_fd = client_fd;
 
-    if (hdr.type == CTRL_MSG_CONSUMER_HELLO) {
+    if (consumer_hello) {
         /* Evict any prior consumer (alive or ghost) and its stale deposit before this
          * one takes over the role. */
         if (ctx->consumer)
@@ -224,10 +270,10 @@ static void handle_new_connection(daemon_ctx *ctx, int listen_fd)
         ctx->deposited_fd_count = fd_count;
         fprintf(stderr, "daemon: consumer connected, %d fds\n", fd_count);
 
-        if (ctx->producer_waiting_fds)
-            try_deliver_fds(ctx);
+        if (ctx->producer_waiting_fds && !try_deliver_fds(ctx))
+            return;
 
-    } else if (hdr.type == CTRL_MSG_PRODUCER_HELLO) {
+    } else if (producer_hello) {
         /* Evict any prior producer (alive or ghost) before this one takes over. */
         if (ctx->producer)
             drop_client(ctx, ctx->producer);
@@ -237,10 +283,14 @@ static void handle_new_connection(daemon_ctx *ctx, int listen_fd)
         ctx->producer_waiting_fds = false;
         fprintf(stderr, "daemon: producer connected\n");
 
-        if (ctx->has_screen_info)
-            send_screen_info_msg(ctx, client_fd);
-        else
+        if (ctx->has_screen_info) {
+            if (send_screen_info_msg(ctx, client_fd) < 0) {
+                drop_client(ctx, c);
+                return;
+            }
+        } else {
             ctx->producer_waiting_screen = true;
+        }
 
     } else {
         close(client_fd);
