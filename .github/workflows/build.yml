@@ -62,6 +62,7 @@ jobs:
       - name: Record Android tool paths
         run: |
           echo "NDK_DIR=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "CANDIDATE_DIR=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/cmake/$CMAKE_VERSION/bin" >> "$GITHUB_PATH"
 
       - name: Generate ephemeral CI signing key
@@ -87,16 +88,17 @@ jobs:
       - name: Stage plain APK and test result
         run: |
           set -euo pipefail
-          mkdir -p candidate
+          mkdir -p "$CANDIDATE_DIR"
           cp consumers/anland_v5/android_consumer/app/build/outputs/apk/plain/release/app-plain-release.apk \
-            candidate/app-plain-release.apk
+            "$CANDIDATE_DIR/app-plain-release.apk"
           result=EXECUTED
           if grep -Eq ":app:testPlainDebugUnitTest NO-SOURCE" "$RUNNER_TEMP/gradle-plain.log"; then
             result=NO-SOURCE
           elif grep -Eq ":app:testPlainDebugUnitTest SKIPPED" "$RUNNER_TEMP/gradle-plain.log"; then
             result=SKIPPED
           fi
-          printf "%s\n" "$result" > candidate/plain-test-result.txt
+          printf "%s\n" "$result" > "$CANDIDATE_DIR/plain-test-result.txt"
+          test -z "$(git status --porcelain)"
 
       - name: Clean and build Tracy profiling APK
         working-directory: consumers/anland_v5/android_consumer
@@ -112,10 +114,11 @@ jobs:
           set -euo pipefail
           app=consumers/anland_v5/android_consumer/app
           cp "$app/build/outputs/apk/tracy/release/app-tracy-release.apk" \
-            candidate/app-tracy-release.apk
+            "$CANDIDATE_DIR/app-tracy-release.apk"
           tracy_license="$(find "$app/.cxx" -type f -path "*/tracy-src/LICENSE" -print -quit)"
           test -n "$tracy_license"
-          cp "$tracy_license" candidate/TRACY-LICENSE
+          cp "$tracy_license" "$CANDIDATE_DIR/TRACY-LICENSE"
+          test -z "$(git status --porcelain)"
 
       - name: Configure and build arm64 Android daemon
         run: |
@@ -165,17 +168,24 @@ jobs:
           PYMOD
           (
             cd "$stage"
-            zip -X -9 -r "$GITHUB_WORKSPACE/candidate/anland-daemon.zip" \
+            zip -X -9 -r "$CANDIDATE_DIR/anland-daemon.zip" \
               META-INF module.prop customize.sh service.sh sepolicy.rule display_daemon
           )
 
       - name: Verify APKs, arm64 JNI, and Magisk ZIP
         run: |
           set -euo pipefail
-          for apk in candidate/app-plain-release.apk candidate/app-tracy-release.apk; do
+          expected_version="5.19-$(git rev-parse --short HEAD)"
+          for apk in "$CANDIDATE_DIR/app-plain-release.apk" "$CANDIDATE_DIR/app-tracy-release.apk"; do
             unzip -t "$apk"
-            "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/aapt2" dump badging "$apk" \
-              | grep -Fq "package: name='com.anland.consumer'"
+            badging="$("$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/aapt2" dump badging "$apk")"
+            grep -Fq "package: name='com.anland.consumer'" <<< "$badging"
+            grep -Fq "versionName='$expected_version'" <<< "$badging"
+            grep -Fq "native-code: 'arm64-v8a'" <<< "$badging"
+            if grep -Eq "^package: .*versionName='[^']*dirty" <<< "$badging"; then
+              echo "Refusing dirty APK versionName in $apk" >&2
+              exit 1
+            fi
             "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner" verify --verbose "$apk"
             mapfile -t native_entries < <(zipinfo -1 "$apk" | grep -E "^lib/arm64-v8a/.*[.]so$")
             test "${#native_entries[@]}" -ge 3
@@ -194,26 +204,26 @@ jobs:
               readelf -h "$output" | grep -Eq "Machine:.*AArch64"
             done
           done
-          unzip -t candidate/anland-daemon.zip
-          actual="$(unzip -Z1 candidate/anland-daemon.zip | grep -v '/$' | sort)"
+          unzip -t "$CANDIDATE_DIR/anland-daemon.zip"
+          actual="$(unzip -Z1 "$CANDIDATE_DIR/anland-daemon.zip" | grep -v '/$' | sort)"
           expected="$(printf '%s\n' \
             META-INF/com/google/android/update-binary \
             META-INF/com/google/android/updater-script \
             customize.sh display_daemon module.prop sepolicy.rule service.sh | sort)"
           test "$actual" = "$expected"
-          test "$(unzip -p candidate/anland-daemon.zip META-INF/com/google/android/updater-script)" = '#MAGISK'
-          unzip -p candidate/anland-daemon.zip META-INF/com/google/android/update-binary \
+          test "$(unzip -p "$CANDIDATE_DIR/anland-daemon.zip" META-INF/com/google/android/updater-script)" = '#MAGISK'
+          unzip -p "$CANDIDATE_DIR/anland-daemon.zip" META-INF/com/google/android/update-binary \
             > "$RUNNER_TEMP/module_installer.sh"
           printf '%s  %s\n' "$MAGISK_INSTALLER_SHA256" "$RUNNER_TEMP/module_installer.sh" \
             | sha256sum --check --strict
-          unzip -p candidate/anland-daemon.zip display_daemon > "$RUNNER_TEMP/display_daemon.from-zip"
+          unzip -p "$CANDIDATE_DIR/anland-daemon.zip" display_daemon > "$RUNNER_TEMP/display_daemon.from-zip"
           cmp build_daemon_android/display_daemon "$RUNNER_TEMP/display_daemon.from-zip"
           file "$RUNNER_TEMP/display_daemon.from-zip" | grep -Eq "ELF 64-bit.*ARM aarch64"
           readelf -h "$RUNNER_TEMP/display_daemon.from-zip" | grep -Eq "Machine:.*AArch64"
-          unzip -p candidate/anland-daemon.zip module.prop | grep -Eq '^id=anland-daemon$'
-          unzip -p candidate/anland-daemon.zip service.sh | grep -Fq 'display_daemon'
+          unzip -p "$CANDIDATE_DIR/anland-daemon.zip" module.prop | grep -Eq '^id=anland-daemon$'
+          unzip -p "$CANDIDATE_DIR/anland-daemon.zip" service.sh | grep -Fq 'display_daemon'
           (
-            cd candidate
+            cd "$CANDIDATE_DIR"
             sha256sum app-plain-release.apk app-tracy-release.apk anland-daemon.zip \
               | sort -k2 > CANDIDATE-SHA256SUMS
             sha256sum -c CANDIDATE-SHA256SUMS
@@ -223,7 +233,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: anland-android-candidate-${{ github.sha }}
-          path: candidate/
+          path: ${{ runner.temp }}/candidate/
           if-no-files-found: error
           retention-days: 30
 
@@ -236,6 +246,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
+      CANDIDATE_DIR: candidate
     steps:
       - name: Check out tagged source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -276,11 +287,11 @@ jobs:
           plain="anland-bridge-$version-plain-release-arm64-v8a.apk"
           tracy="anland-bridge-$version-tracy-profiling-release-arm64-v8a.apk"
           mkdir -p release
-          cp candidate/app-plain-release.apk "release/$plain"
-          cp candidate/app-tracy-release.apk "release/$tracy"
-          cp candidate/anland-daemon.zip release/anland-daemon.zip
+          cp "$CANDIDATE_DIR/app-plain-release.apk" "release/$plain"
+          cp "$CANDIDATE_DIR/app-tracy-release.apk" "release/$tracy"
+          cp "$CANDIDATE_DIR/anland-daemon.zip" release/anland-daemon.zip
           cp LICENSE release/LICENSE
-          test_result="$(cat candidate/plain-test-result.txt)"
+          test_result="$(cat "$CANDIDATE_DIR/plain-test-result.txt")"
           cat > release/BUILD-METADATA.txt <<'END_META'
           project=collegeming/anland-bridge
           release_tag=TAG_VALUE
@@ -322,7 +333,7 @@ jobs:
           The Tracy profiling APK only includes Tracy v0.14.0. Its license follows.
 
           END_NOTICE
-          cat candidate/TRACY-LICENSE >> release/THIRD-PARTY-NOTICES.txt
+          cat "$CANDIDATE_DIR/TRACY-LICENSE" >> release/THIRD-PARTY-NOTICES.txt
           {
             printf 'Android-host assets built from annotated tag %s at commit %s.\n\n' "$tag" "$GITHUB_SHA"
             printf -- '- Plain APK: `%s` for normal deployment.\n' "$plain"
