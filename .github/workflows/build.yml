@@ -6,7 +6,7 @@ on:
       - bridge-service-toggle
     tags:
       - "anland-v*"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 concurrency:
   group: anland-android-${{ github.ref }}
@@ -352,19 +352,31 @@ jobs:
             --notes-file "$RUNNER_TEMP/release-notes.txt" \
             --title "Anland Android bridge ${tag#anland-v}" \
             --verify-tag
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id)"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq .draft)" = true
+          mapfile -t release_ids < <(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+              --jq ".[] | select(.draft == true and .tag_name == \"$tag\") | .id"
+          )
+          test "${#release_ids[@]}" -eq 1
+          release_id="${release_ids[0]}"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          test "$(jq -r .draft <<< "$release_json")" = true
+          test "$(jq -r .tag_name <<< "$release_json")" = "$tag"
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
             --jq '.[].name' | sort > "$RUNNER_TEMP/remote-assets"
           diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/remote-assets"
           mkdir -p "$RUNNER_TEMP/downloaded-release"
-          gh release download "$tag" --dir "$RUNNER_TEMP/downloaded-release"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
+            --jq '.[] | [.id, .name, .size] | @tsv' > "$RUNNER_TEMP/remote-assets.tsv"
+          while IFS=$'\t' read -r asset_id asset size; do
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "$RUNNER_TEMP/downloaded-release/$asset"
+            test "$(stat -c %s "$RUNNER_TEMP/downloaded-release/$asset")" = "$size"
+            cmp "release/$asset" "$RUNNER_TEMP/downloaded-release/$asset"
+          done < "$RUNNER_TEMP/remote-assets.tsv"
           find "$RUNNER_TEMP/downloaded-release" -maxdepth 1 -type f -printf "%f\n" \
             | sort > "$RUNNER_TEMP/downloaded-assets"
           diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/downloaded-assets"
-          while IFS= read -r asset; do
-            cmp "release/$asset" "$RUNNER_TEMP/downloaded-release/$asset"
-          done < "$RUNNER_TEMP/expected-assets"
           (
             cd "$RUNNER_TEMP/downloaded-release"
             sha256sum --check --strict SHA256SUMS
