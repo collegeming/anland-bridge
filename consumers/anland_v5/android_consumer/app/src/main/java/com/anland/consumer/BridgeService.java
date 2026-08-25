@@ -426,6 +426,20 @@ public final class BridgeService extends Service {
                 long awaiting = state.awaitingClipboardAck.get();
                 if (ack == awaiting) state.awaitingClipboardAck.compareAndSet(awaiting, 0);
                 return;
+            case BridgeProtocol.MSG_CLIPBOARD_IMAGE:
+                dispatchClipboardImage(state, message.payload);
+                return;
+            case BridgeProtocol.MSG_AUDIO_START:
+                setRemoteAudio(state, BridgeProtocol.parseAudioStart(message.payload));
+                return;
+            case BridgeProtocol.MSG_AUDIO_STOP:
+                requireRemaining(payload, 0);
+                setRemoteAudio(state, null);
+                return;
+            case BridgeProtocol.MSG_FILE_CONTENT_REQUEST:
+                dispatchFileContentRequest(state,
+                        BridgeProtocol.parseFileContentRequest(message.payload));
+                return;
             default:
                 break;
         }
@@ -467,6 +481,62 @@ public final class BridgeService extends Service {
         String text = BridgeProtocol.decodeClipboard(utf8);
         displaySession.clipboard().applyBridgeClipboard(text, utf8, state.clipboardSink);
         queueControlFrame(state, BridgeProtocol.clipboardAck(sequence));
+    }
+
+    /**
+     * Windows copied an image (CF_DIB → PNG on the server): put it on the
+     * Android clipboard. Needs a FileProvider URI + ClipData (the PNG must be
+     * written to a cache file first). Wired to the protocol; the clipboard
+     * provider plumbing is a follow-up.
+     */
+    private void dispatchClipboardImage(ConnectionState state, byte[] payload)
+            throws IOException {
+        long sequence = BridgeProtocol.clipboardImageSequence(payload);
+        byte[] png = BridgeProtocol.clipboardImageBytes(payload);
+        // TODO: write `png` to getCacheDir()/clip.png, share via FileProvider,
+        // ClipData.newUri(ClipDescription.MIMETYPE_IMAGE_PNG, uri) on the
+        // system clipboard, then ACK. ACK now so the server does not replay.
+        Log.w(TAG, "Clipboard image from Windows ignored (FileProvider plumbing pending), "
+                + png.length + " bytes, seq " + sequence);
+        queueControlFrame(state, BridgeProtocol.clipboardAck(sequence));
+    }
+
+    /**
+     * Server wants RDPSND audio: start/stop capturing Android output audio.
+     * Unprivileged apps cannot capture system output directly (needs
+     * AudioRecord REMOTE_SUBMIX = MODIFY_AUDIO_ROUTING system permission, or a
+     * root loopback). Wired to the protocol; the capture source is the
+     * follow-up. {@code start} null = stop.
+     */
+    private void setRemoteAudio(ConnectionState state, BridgeProtocol.AudioStart start) {
+        if (start == null) {
+            Log.d(TAG, "Remote audio stop requested (capture source pending)");
+            // TODO: stop the AudioRecord loop; drain queued AUDIO_CHUNKs.
+            return;
+        }
+        Log.w(TAG, "Remote audio start requested: " + start.sampleRate + "Hz/"
+                + start.channels + "ch format=" + start.format
+                + " — capture source (REMOTE_SUBMIX/root) pending");
+        // TODO: start an AudioRecord (REMOTE_SUBMIX, privileged) capture loop
+        // that queues BridgeProtocol.audioChunk(...) via queueControlFrame.
+    }
+
+    /**
+     * Windows asked for a byte range of clipboard file `index`. Serve from the
+     * SAF URIs recorded at copy time (ContentResolver.openInputStream +
+     * skip(position), cap `length`). Not yet wired: respond with an empty body
+     * (= EOF/error) so the server's 5 s RANGE task completes cleanly instead
+     * of hanging.
+     */
+    private void dispatchFileContentRequest(ConnectionState state,
+            BridgeProtocol.FileContentRequest request) throws IOException {
+        Log.w(TAG, "File content request index=" + request.index
+                + " offset=" + request.offset + " length=" + request.length
+                + " (SAF file provider pending)");
+        // TODO: resolve request.index into a persisted content URI, read the
+        // range, and reply with the bytes. Empty = EOF/error for now.
+        queueControlFrame(state, BridgeProtocol.fileContentResponse(request.requestId,
+                new byte[0]));
     }
 
     private void startRemoteStream(ConnectionState state, int width, int height, int fps)

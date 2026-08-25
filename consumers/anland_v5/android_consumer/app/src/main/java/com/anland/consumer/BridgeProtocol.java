@@ -29,10 +29,22 @@ final class BridgeProtocol {
     static final int MSG_CLIPBOARD = 5;
     static final int MSG_CLIPBOARD_ACK = 6;
     static final int MSG_INPUT_RESET = 7;
+    // CLIPBOARD_IMAGE is 8 on the server (7 is INPUT_RESET here).
+    static final int MSG_CLIPBOARD_IMAGE = 8;
     static final int MSG_VIDEO_FRAME = 16;
     static final int MSG_IDR_REQUEST = 17;
     static final int MSG_STREAM_START = 18;
     static final int MSG_STREAM_STOP = 19;
+    static final int MSG_AUDIO_CHUNK = 20;
+    static final int MSG_AUDIO_START = 21;
+    static final int MSG_AUDIO_STOP = 22;
+    static final int MSG_FILE_LIST = 23;
+    static final int MSG_FILE_CONTENT_REQUEST = 24;
+    static final int MSG_FILE_CONTENT_RESPONSE = 25;
+
+    // Audio sample formats on the wire.
+    static final int AUDIO_FORMAT_PCM16 = 0;
+    static final int AUDIO_FORMAT_AAC = 1;
 
     static final int MSG_AUTH_INIT = 32;
     static final int MSG_AUTH_SERVER_PROOF = 33;
@@ -240,6 +252,115 @@ final class BridgeProtocol {
         long sequence = littleEndian(payload).getLong();
         if (sequence == 0) throw new IOException("Invalid zero clipboard ACK sequence");
         return sequence;
+    }
+
+    /* Clipboard image: MSG_CLIPBOARD_IMAGE = sequence:u64 || png[]. */
+    static byte[] clipboardImage(long sequence, byte[] png) {
+        if (png == null || png.length == 0) {
+            throw new IllegalArgumentException("Clipboard image is empty");
+        }
+        ByteBuffer payload = ByteBuffer.allocate(8 + png.length).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putLong(sequence).put(png);
+        return frame(MSG_CLIPBOARD_IMAGE, payload.array());
+    }
+
+    static long clipboardImageSequence(byte[] payload) throws IOException {
+        if (payload.length < 9) throw new IOException("Invalid clipboard image");
+        long sequence = littleEndian(payload).getLong();
+        if (sequence == 0) throw new IOException("Invalid zero clipboard image sequence");
+        return sequence;
+    }
+
+    static byte[] clipboardImageBytes(byte[] payload) throws IOException {
+        clipboardImageSequence(payload);
+        return Arrays.copyOfRange(payload, 8, payload.length);
+    }
+
+    /* Audio: MSG_AUDIO_CHUNK = sample_rate:u32 || channels:u16 || format:u8
+     *                          || timestamp_ms:u64 || data[].
+     * MSG_AUDIO_START = sample_rate:u32 || channels:u16 || format:u8. */
+    static byte[] audioChunk(int sampleRate, int channels, int format,
+                             long timestampMs, byte[] data) {
+        if (data == null || data.length == 0) {
+            throw new IllegalArgumentException("Audio chunk is empty");
+        }
+        ByteBuffer payload = ByteBuffer.allocate(15 + data.length).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putInt(sampleRate).putShort((short) channels).put((byte) format)
+                .putLong(timestampMs).put(data);
+        return frame(MSG_AUDIO_CHUNK, payload.array());
+    }
+
+    static byte[] audioStart(int sampleRate, int channels, boolean aac) {
+        ByteBuffer payload = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putInt(sampleRate).putShort((short) channels)
+                .put((byte) (aac ? AUDIO_FORMAT_AAC : AUDIO_FORMAT_PCM16));
+        return frame(MSG_AUDIO_START, payload.array());
+    }
+
+    /** Decoded MSG_AUDIO_START payload. */
+    static final class AudioStart {
+        final int sampleRate;
+        final int channels;
+        final int format;
+
+        AudioStart(int sampleRate, int channels, int format) {
+            this.sampleRate = sampleRate;
+            this.channels = channels;
+            this.format = format;
+        }
+    }
+
+    static AudioStart parseAudioStart(byte[] payload) throws IOException {
+        if (payload.length != 7) throw new IOException("Invalid audio start");
+        ByteBuffer b = littleEndian(payload);
+        return new AudioStart(b.getInt(), b.getShort() & 0xffff, b.get() & 0xff);
+    }
+
+    /* Files: MSG_FILE_LIST = sequence:u64 || count:u32 ||
+     *         entries[] (name_len:u16 || name || size:u64).
+     * MSG_FILE_CONTENT_REQUEST = request_id:u32 || index:u32 || offset:u64 || length:u32.
+     * MSG_FILE_CONTENT_RESPONSE = request_id:u32 || data[]. */
+    static byte[] fileList(long sequence, String[] names, long[] sizes) {
+        int count = Math.min(names.length, sizes.length);
+        int capacity = 12;
+        for (int i = 0; i < count; i++) {
+            capacity += 2 + names[i].getBytes(StandardCharsets.UTF_8).length + 8;
+        }
+        ByteBuffer payload = ByteBuffer.allocate(capacity).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putLong(sequence).putInt(count);
+        for (int i = 0; i < count; i++) {
+            byte[] name = names[i].getBytes(StandardCharsets.UTF_8);
+            payload.putShort((short) name.length).put(name).putLong(sizes[i]);
+        }
+        return frame(MSG_FILE_LIST, payload.array());
+    }
+
+    /** Decoded MSG_FILE_CONTENT_REQUEST payload. */
+    static final class FileContentRequest {
+        final int requestId;
+        final int index;
+        final long offset;
+        final int length;
+
+        FileContentRequest(int requestId, int index, long offset, int length) {
+            this.requestId = requestId;
+            this.index = index;
+            this.offset = offset;
+            this.length = length;
+        }
+    }
+
+    static FileContentRequest parseFileContentRequest(byte[] payload) throws IOException {
+        if (payload.length != 20) throw new IOException("Invalid file content request");
+        ByteBuffer b = littleEndian(payload);
+        return new FileContentRequest(b.getInt(), b.getInt(), b.getLong(), b.getInt());
+    }
+
+    static byte[] fileContentResponse(int requestId, byte[] data) {
+        if (data == null) data = new byte[0];
+        ByteBuffer payload = ByteBuffer.allocate(4 + data.length).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putInt(requestId).put(data);
+        return frame(MSG_FILE_CONTENT_RESPONSE, payload.array());
     }
 
     static byte[] videoFrame(int encodedWidth, int encodedHeight,
