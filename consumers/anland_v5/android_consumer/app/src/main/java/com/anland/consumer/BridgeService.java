@@ -4,9 +4,13 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ClipData;
+import android.content.ClipDescription;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
@@ -14,6 +18,7 @@ import android.util.Log;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -477,20 +482,32 @@ public final class BridgeService extends Service {
     }
 
     /**
-     * Windows copied an image (CF_DIB → PNG on the server): put it on the
-     * Android clipboard. Needs a FileProvider URI + ClipData (the PNG must be
-     * written to a cache file first). Wired to the protocol; the clipboard
-     * provider plumbing is a follow-up.
+     * Windows copied an image (CF_DIB → PNG on the server): write the PNG to a
+     * cache file, share it via {@link ClipImageProvider}, and put it on the
+     * Android clipboard. ACK after applying so the server stops replaying.
      */
     private void dispatchClipboardImage(ConnectionState state, byte[] payload)
             throws IOException {
         long sequence = BridgeProtocol.clipboardImageSequence(payload);
         byte[] png = BridgeProtocol.clipboardImageBytes(payload);
-        // TODO: write `png` to getCacheDir()/clip.png, share via FileProvider,
-        // ClipData.newUri(ClipDescription.MIMETYPE_IMAGE_PNG, uri) on the
-        // system clipboard, then ACK. ACK now so the server does not replay.
-        Log.w(TAG, "Clipboard image from Windows ignored (FileProvider plumbing pending), "
-                + png.length + " bytes, seq " + sequence);
+        File clipDir = new File(getCacheDir(), "clip");
+        if (!clipDir.isDirectory() && !clipDir.mkdirs()) {
+            throw new IOException("Cannot create clipboard image dir " + clipDir);
+        }
+        File image = new File(clipDir, "bridge_clip.png");
+        try (java.io.FileOutputStream out = new java.io.FileOutputStream(image)) {
+            out.write(png);
+        }
+        Uri uri = ClipImageProvider.uriFor(getApplicationContext());
+        ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (cm != null) {
+            ClipData clip = new ClipData(
+                    new ClipDescription("anland image",
+                            new String[] { ClipDescription.MIMETYPE_IMAGE_PNG }),
+                    new ClipData.Item(uri));
+            cm.setPrimaryClip(clip);
+            Log.d(TAG, "Windows clipboard image applied (" + png.length + " bytes)");
+        }
         queueControlFrame(state, BridgeProtocol.clipboardAck(sequence));
     }
 

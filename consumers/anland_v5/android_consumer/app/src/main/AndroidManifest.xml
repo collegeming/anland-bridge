@@ -24,6 +24,13 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
+        <!-- Shares the clipboard image written to cacheDir/clip (Windows→Android copy). -->
+        <provider
+            android:name=".ClipImageProvider"
+            android:authorities="${applicationId}.clip"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <service
             android:name=".BridgeService"
             android:exported="false"
