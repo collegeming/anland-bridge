@@ -429,13 +429,6 @@ public final class BridgeService extends Service {
             case BridgeProtocol.MSG_CLIPBOARD_IMAGE:
                 dispatchClipboardImage(state, message.payload);
                 return;
-            case BridgeProtocol.MSG_AUDIO_START:
-                setRemoteAudio(state, BridgeProtocol.parseAudioStart(message.payload));
-                return;
-            case BridgeProtocol.MSG_AUDIO_STOP:
-                requireRemaining(payload, 0);
-                setRemoteAudio(state, null);
-                return;
             case BridgeProtocol.MSG_FILE_CONTENT_REQUEST:
                 dispatchFileContentRequest(state,
                         BridgeProtocol.parseFileContentRequest(message.payload));
@@ -499,26 +492,6 @@ public final class BridgeService extends Service {
         Log.w(TAG, "Clipboard image from Windows ignored (FileProvider plumbing pending), "
                 + png.length + " bytes, seq " + sequence);
         queueControlFrame(state, BridgeProtocol.clipboardAck(sequence));
-    }
-
-    /**
-     * Server wants RDPSND audio: start/stop capturing Android output audio.
-     * Unprivileged apps cannot capture system output directly (needs
-     * AudioRecord REMOTE_SUBMIX = MODIFY_AUDIO_ROUTING system permission, or a
-     * root loopback). Wired to the protocol; the capture source is the
-     * follow-up. {@code start} null = stop.
-     */
-    private void setRemoteAudio(ConnectionState state, BridgeProtocol.AudioStart start) {
-        if (start == null) {
-            Log.d(TAG, "Remote audio stop requested (capture source pending)");
-            // TODO: stop the AudioRecord loop; drain queued AUDIO_CHUNKs.
-            return;
-        }
-        Log.w(TAG, "Remote audio start requested: " + start.sampleRate + "Hz/"
-                + start.channels + "ch format=" + start.format
-                + " — capture source (REMOTE_SUBMIX/root) pending");
-        // TODO: start an AudioRecord (REMOTE_SUBMIX, privileged) capture loop
-        // that queues BridgeProtocol.audioChunk(...) via queueControlFrame.
     }
 
     /**

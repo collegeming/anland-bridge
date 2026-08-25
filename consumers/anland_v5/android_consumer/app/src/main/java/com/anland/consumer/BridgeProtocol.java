@@ -35,16 +35,9 @@ final class BridgeProtocol {
     static final int MSG_IDR_REQUEST = 17;
     static final int MSG_STREAM_START = 18;
     static final int MSG_STREAM_STOP = 19;
-    static final int MSG_AUDIO_CHUNK = 20;
-    static final int MSG_AUDIO_START = 21;
-    static final int MSG_AUDIO_STOP = 22;
     static final int MSG_FILE_LIST = 23;
     static final int MSG_FILE_CONTENT_REQUEST = 24;
     static final int MSG_FILE_CONTENT_RESPONSE = 25;
-
-    // Audio sample formats on the wire.
-    static final int AUDIO_FORMAT_PCM16 = 0;
-    static final int AUDIO_FORMAT_AAC = 1;
 
     static final int MSG_AUTH_INIT = 32;
     static final int MSG_AUTH_SERVER_PROOF = 33;
@@ -274,46 +267,6 @@ final class BridgeProtocol {
     static byte[] clipboardImageBytes(byte[] payload) throws IOException {
         clipboardImageSequence(payload);
         return Arrays.copyOfRange(payload, 8, payload.length);
-    }
-
-    /* Audio: MSG_AUDIO_CHUNK = sample_rate:u32 || channels:u16 || format:u8
-     *                          || timestamp_ms:u64 || data[].
-     * MSG_AUDIO_START = sample_rate:u32 || channels:u16 || format:u8. */
-    static byte[] audioChunk(int sampleRate, int channels, int format,
-                             long timestampMs, byte[] data) {
-        if (data == null || data.length == 0) {
-            throw new IllegalArgumentException("Audio chunk is empty");
-        }
-        ByteBuffer payload = ByteBuffer.allocate(15 + data.length).order(ByteOrder.LITTLE_ENDIAN);
-        payload.putInt(sampleRate).putShort((short) channels).put((byte) format)
-                .putLong(timestampMs).put(data);
-        return frame(MSG_AUDIO_CHUNK, payload.array());
-    }
-
-    static byte[] audioStart(int sampleRate, int channels, boolean aac) {
-        ByteBuffer payload = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN);
-        payload.putInt(sampleRate).putShort((short) channels)
-                .put((byte) (aac ? AUDIO_FORMAT_AAC : AUDIO_FORMAT_PCM16));
-        return frame(MSG_AUDIO_START, payload.array());
-    }
-
-    /** Decoded MSG_AUDIO_START payload. */
-    static final class AudioStart {
-        final int sampleRate;
-        final int channels;
-        final int format;
-
-        AudioStart(int sampleRate, int channels, int format) {
-            this.sampleRate = sampleRate;
-            this.channels = channels;
-            this.format = format;
-        }
-    }
-
-    static AudioStart parseAudioStart(byte[] payload) throws IOException {
-        if (payload.length != 7) throw new IOException("Invalid audio start");
-        ByteBuffer b = littleEndian(payload);
-        return new AudioStart(b.getInt(), b.getShort() & 0xffff, b.get() & 0xff);
     }
 
     /* Files: MSG_FILE_LIST = sequence:u64 || count:u32 ||
