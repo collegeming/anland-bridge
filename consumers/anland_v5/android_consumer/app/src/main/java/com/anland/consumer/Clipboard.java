@@ -18,6 +18,8 @@ import java.util.Arrays;
 public final class Clipboard {
     interface BridgeSink {
         void onClipboard(byte[] utf8);
+        /** Android copied files (SAF URIs): offer them to the bridge. */
+        void onClipboardFiles(String[] names, long[] sizes, android.net.Uri[] uris);
     }
 
     private static final String TAG = "AnlandClipboard";
@@ -108,8 +110,19 @@ public final class Clipboard {
     private void pushClipboard(boolean force, BridgeSink sink) {
         ClipboardManager cm = context.getSystemService(ClipboardManager.class);
         if (cm == null) return;
-        String text = "";
         ClipData clip = cm.getPrimaryClip();
+        // Files first: a content-URI item that is not plain text. SAF picks
+        // (content URIs) carry the file; a plain-text clip has no URI.
+        if (clip != null && clip.getItemCount() > 0) {
+            android.net.Uri[] uris = collectFileUris(clip);
+            if (uris.length > 0) {
+                String[] names = resolveNames(uris);
+                long[] sizes = resolveSizes(uris);
+                if (sink != null) sink.onClipboardFiles(names, sizes, uris);
+                return;
+            }
+        }
+        String text = "";
         if (clip != null && clip.getItemCount() > 0) {
             CharSequence value = clip.getItemAt(0).coerceToText(context);
             if (value != null) text = value.toString();
@@ -123,6 +136,61 @@ public final class Clipboard {
         mLastSentClip = text;
         mNative.sendClipboard(utf8);
         if (sink != null) sink.onClipboard(Arrays.copyOf(utf8, utf8.length));
+    }
+
+    /** Collect content URIs from the primary clip (files), skipping text-only items. */
+    private android.net.Uri[] collectFileUris(ClipData clip) {
+        int count = clip.getItemCount();
+        int n = 0;
+        for (int i = 0; i < count; i++) {
+            if (clip.getItemAt(i).getUri() != null) n++;
+        }
+        if (n == 0) return new android.net.Uri[0];
+        android.net.Uri[] uris = new android.net.Uri[n];
+        int k = 0;
+        for (int i = 0; i < count; i++) {
+            android.net.Uri uri = clip.getItemAt(i).getUri();
+            if (uri != null) uris[k++] = uri;
+        }
+        return uris;
+    }
+
+    /** Resolve display names via ContentResolver (OpenableColumns.DISPLAY_NAME). */
+    private String[] resolveNames(android.net.Uri[] uris) {
+        String[] names = new String[uris.length];
+        for (int i = 0; i < uris.length; i++) {
+            String name = null;
+            try (android.database.Cursor c = context.getContentResolver()
+                    .query(uris[i], new String[] { android.provider.OpenableColumns.DISPLAY_NAME },
+                            null, null, null)) {
+                if (c != null && c.moveToFirst()) {
+                    name = c.getString(0);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "resolve name failed for " + uris[i], e);
+            }
+            names[i] = (name != null && !name.isEmpty()) ? name : "file_" + i;
+        }
+        return names;
+    }
+
+    /** Resolve sizes via ContentResolver (OpenableColumns.SIZE; unknown → 0). */
+    private long[] resolveSizes(android.net.Uri[] uris) {
+        long[] sizes = new long[uris.length];
+        for (int i = 0; i < uris.length; i++) {
+            long size = 0;
+            try (android.database.Cursor c = context.getContentResolver()
+                    .query(uris[i], new String[] { android.provider.OpenableColumns.SIZE },
+                            null, null, null)) {
+                if (c != null && c.moveToFirst() && !c.isNull(0)) {
+                    size = c.getLong(0);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "resolve size failed for " + uris[i], e);
+            }
+            sizes[i] = size;
+        }
+        return sizes;
     }
 
     private synchronized BridgeSink bridgeSinkSnapshot() {

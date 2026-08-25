@@ -113,6 +113,8 @@ public final class BridgeService extends Service {
         final Object streamLock = new Object();
         final Object videoWriteLock = new Object();
         Clipboard.BridgeSink clipboardSink;
+        /** SAF URIs of the clipboard files we advertised (for serving ranges). */
+        volatile android.net.Uri[] fileUris = new android.net.Uri[0];
         Thread writerThread;
 
         ConnectionState(long generation, ParcelFileDescriptor descriptor,
@@ -320,7 +322,17 @@ public final class BridgeService extends Service {
                     state = new ConnectionState(nextConnectionGeneration, descriptor,
                             writerDescriptor);
                     ConnectionState active = state;
-                    active.clipboardSink = utf8 -> queueClipboard(active, utf8);
+                    active.clipboardSink = new Clipboard.BridgeSink() {
+                        @Override
+                        public void onClipboard(byte[] utf8) {
+                            queueClipboard(active, utf8);
+                        }
+
+                        @Override
+                        public void onClipboardFiles(String[] names, long[] sizes, Uri[] uris) {
+                            queueClipboardFiles(active, names, sizes, uris);
+                        }
+                    };
                     active.connected.set(true);
                     active.writerThread = new Thread(
                             () -> writerLoop(active, output), "anland-bridge-writer");
@@ -513,20 +525,51 @@ public final class BridgeService extends Service {
 
     /**
      * Windows asked for a byte range of clipboard file `index`. Serve from the
-     * SAF URIs recorded at copy time (ContentResolver.openInputStream +
-     * skip(position), cap `length`). Not yet wired: respond with an empty body
-     * (= EOF/error) so the server's 5 s RANGE task completes cleanly instead
-     * of hanging.
+     * SAF URIs recorded at copy time via ContentResolver: open the input
+     * stream, skip `offset`, read up to `length` bytes. Empty data = EOF/error.
      */
     private void dispatchFileContentRequest(ConnectionState state,
             BridgeProtocol.FileContentRequest request) throws IOException {
-        Log.w(TAG, "File content request index=" + request.index
-                + " offset=" + request.offset + " length=" + request.length
-                + " (SAF file provider pending)");
-        // TODO: resolve request.index into a persisted content URI, read the
-        // range, and reply with the bytes. Empty = EOF/error for now.
-        queueControlFrame(state, BridgeProtocol.fileContentResponse(request.requestId,
-                new byte[0]));
+        int index = request.index;
+        Uri[] uris = state.fileUris;
+        if (uris == null || index < 0 || index >= uris.length) {
+            Log.w(TAG, "File content request out of range: index=" + index);
+            queueControlFrame(state, BridgeProtocol.fileContentResponse(request.requestId,
+                    new byte[0]));
+            return;
+        }
+        if (request.length > BridgeProtocol.MAX_FRAME_SIZE - 4) {
+            Log.w(TAG, "File content request too large: " + request.length);
+            queueControlFrame(state, BridgeProtocol.fileContentResponse(request.requestId,
+                    new byte[0]));
+            return;
+        }
+        byte[] data = new byte[0];
+        try (java.io.InputStream in = getContentResolver().openInputStream(uris[index])) {
+            if (in != null) {
+                long skipped = 0;
+                while (skipped < request.offset) {
+                    long s = in.skip(request.offset - skipped);
+                    if (s <= 0) break;
+                    skipped += s;
+                }
+                if (skipped >= request.offset) {
+                    int want = request.length;
+                    java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(want);
+                    byte[] buf = new byte[Math.min(want, 64 * 1024)];
+                    int n;
+                    while (out.size() < want && (n = in.read(buf, 0,
+                            Math.min(buf.length, want - out.size()))) > 0) {
+                        out.write(buf, 0, n);
+                    }
+                    data = out.toByteArray();
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "File content read failed for " + uris[index], e);
+            data = new byte[0];
+        }
+        queueControlFrame(state, BridgeProtocol.fileContentResponse(request.requestId, data));
     }
 
     private void startRemoteStream(ConnectionState state, int width, int height, int fps)
@@ -598,6 +641,23 @@ public final class BridgeService extends Service {
         long sequence = nextClipboardSequence();
         state.awaitingClipboardAck.set(sequence);
         state.pendingClipboard.set(BridgeProtocol.clipboard(sequence, utf8));
+    }
+
+    /**
+     * Android copied files: store the SAF URIs (for serving ranges) and send
+     * the FILE_LIST so the server advertises them to mstsc.
+     */
+    private void queueClipboardFiles(ConnectionState state, String[] names, long[] sizes,
+                                     Uri[] uris) {
+        if (!isActiveConnection(state) || uris == null || uris.length == 0) return;
+        state.fileUris = uris;
+        long sequence = nextClipboardSequence();
+        try {
+            queueControlFrame(state,
+                    BridgeProtocol.fileList(sequence, names, sizes));
+        } catch (IOException e) {
+            Log.w(TAG, "queue file list failed", e);
+        }
     }
 
     private long nextClipboardSequence() {
