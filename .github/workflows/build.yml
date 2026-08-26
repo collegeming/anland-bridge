@@ -65,13 +65,13 @@ jobs:
           echo "CANDIDATE_DIR=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/cmake/$CMAKE_VERSION/bin" >> "$GITHUB_PATH"
 
-      - name: Generate ephemeral CI signing key
+      - name: Restore fixed release signing key
         run: |
           mkdir -p "$HOME/.android"
-          keytool -genkeypair -keystore "$HOME/.android/anland-ci.keystore" \
-            -storepass android -alias anlandci -keypass android \
-            -keyalg RSA -keysize 3072 -validity 3650 \
-            -dname "CN=Anland CI Release, O=Anland, C=US" -noprompt
+          printf '%s' "${{ secrets.ANLAND_SIGNING_KEYSTORE_BASE64 }}" \
+            | base64 --decode > "$HOME/.android/anland-ci.keystore"
+          keytool -list -keystore "$HOME/.android/anland-ci.keystore" \
+            -storepass android -alias anlandci >/dev/null 2>&1
 
       - name: Clean, test, and build plain release APK
         working-directory: consumers/anland_v5/android_consumer
@@ -317,7 +317,7 @@ jobs:
           tracy_status=profiling-only
           video_encoder=Android MediaCodec hardware H.264 only; no software fallback
           deployment_boundary=Android host/root only; do not install these assets into Linux RootFS
-          apk_signing=ephemeral CI release key; uninstall incompatible prior signatures before installation
+          apk_signing=fixed anland release key; upgrade-compatible with prior releases
           END_META
           sed -i \
             -e "s|TAG_VALUE|$tag|" \
@@ -342,7 +342,7 @@ jobs:
             printf -- '- `SHA256SUMS`, `BUILD-METADATA.txt`, `LICENSE`, and `THIRD-PARTY-NOTICES.txt` authenticate and describe the build.\n\n'
             printf '`testPlainDebugUnitTest` result: `%s`. `NO-SOURCE` means no Java unit tests existed; this Release does not claim otherwise.\n\n' "$test_result"
             printf 'These assets belong on the Android host/root side only and must not be installed in the Linux RootFS. Video encoding is hardware MediaCodec H.264 only, with no software fallback.\n\n'
-            printf 'APKs use an ephemeral CI signing key. They are not upgrade-compatible with APKs signed by a different key.\n'
+            printf 'APKs are signed with the fixed Anland release key and are upgrade-compatible with prior releases.\n'
           } > "$RUNNER_TEMP/release-notes.txt"
           (
             cd release
