@@ -13,7 +13,9 @@ import android.view.Surface;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 final class MediaCodecEncoder implements AutoCloseable {
     interface FrameSink {
@@ -42,14 +44,30 @@ final class MediaCodecEncoder implements AutoCloseable {
                       Runnable failureHandler) throws IOException {
         this.sink = sink;
         this.failureHandler = failureHandler;
-        EncoderSelection selection = findHardwareEncoder(width, height, fps);
-        if (selection == null) {
+        List<EncoderSelection> selections = findHardwareEncoders(width, height, fps);
+        if (selections.isEmpty()) {
             throw new IOException("No compatible hardware H.264 Surface encoder is available");
         }
-        int selectedBitRate = Math.max(selection.minBitRate,
-                Math.min(selection.maxBitRate, bitRate));
-        InitializedCodec initialized = initializeCodec(selection, width, height, fps,
-                selectedBitRate);
+        InitializedCodec initialized = null;
+        IOException lastFailure = null;
+        int selectedBitRate = 0;
+        for (EncoderSelection selection : selections) {
+            selectedBitRate = Math.max(selection.minBitRate,
+                    Math.min(selection.maxBitRate, bitRate));
+            try {
+                initialized = initializeCodec(selection, width, height, fps, selectedBitRate);
+                break;
+            } catch (IOException | RuntimeException e) {
+                lastFailure = e instanceof IOException ? (IOException) e
+                        : new IOException("Codec configure failed", e);
+                Log.w(TAG, "Encoder " + selection.codecName + " failed to configure; "
+                        + "trying the next candidate", e);
+            }
+        }
+        if (initialized == null) {
+            throw new IOException("All hardware H.264 Surface encoders failed to configure",
+                    lastFailure);
+        }
         codec = initialized.codec;
         inputSurface = initialized.surface;
 
@@ -119,7 +137,17 @@ final class MediaCodecEncoder implements AutoCloseable {
         }
     }
 
-    private static EncoderSelection findHardwareEncoder(int width, int height, int fps) {
+    /**
+     * Collect every hardware H.264 encoder that advertises Surface input and
+     * supports the requested geometry. Some vendor OMX components advertise
+     * `COLOR_FormatSurface` in their capabilities yet reject it at runtime
+     * (e.g. `OMX.qcom.video.encoder.avc`), so we cannot trust the first hit:
+     * rank QTI C2 components first, leave the legacy OMX component as a
+     * fallback, and let the constructor try each candidate in turn.
+     */
+    private static List<EncoderSelection> findHardwareEncoders(int width, int height, int fps) {
+        List<EncoderSelection> preferred = new ArrayList<>();
+        List<EncoderSelection> fallbacks = new ArrayList<>();
         MediaCodecList codecs = new MediaCodecList(MediaCodecList.ALL_CODECS);
         for (MediaCodecInfo info : codecs.getCodecInfos()) {
             if (!info.isEncoder() || !info.isHardwareAccelerated()) continue;
@@ -162,11 +190,20 @@ final class MediaCodecEncoder implements AutoCloseable {
                     break;
                 }
             }
-            return new EncoderSelection(info.getName(), bitRateMode, mainProfile,
+            EncoderSelection selection = new EncoderSelection(info.getName(), bitRateMode,
+                    mainProfile,
                     capabilities.getVideoCapabilities().getBitrateRange().getLower(),
                     capabilities.getVideoCapabilities().getBitrateRange().getUpper());
+            if (info.getName().contains("c2.qti")) {
+                preferred.add(selection);
+            } else if (!info.getName().contains("OMX.qcom.video.encoder")) {
+                preferred.add(selection);
+            } else {
+                fallbacks.add(selection);
+            }
         }
-        return null;
+        preferred.addAll(fallbacks);
+        return preferred;
     }
 
     Surface getInputSurface() {
