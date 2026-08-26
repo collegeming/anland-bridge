@@ -515,7 +515,7 @@ public final class BridgeService extends Service {
         if (cm != null) {
             ClipData clip = new ClipData(
                     new ClipDescription("anland image",
-                            new String[] { ClipDescription.MIMETYPE_IMAGE_PNG }),
+                            new String[] { "image/png" }),
                     new ClipData.Item(uri));
             cm.setPrimaryClip(clip);
             Log.d(TAG, "Windows clipboard image applied (" + png.length + " bytes)");
