@@ -2296,7 +2296,7 @@ Java_com_anland_consumer_Native_nativeStartFanout(
 {
     (void)clazz;
     return start_consumer(env, handle, local_surface, encoder_surface,
-                          clipboard_target, activity_target, false, true,
+                          clipboard_target, activity_target, true, true,
                           display_width, display_height, encoded_width, encoded_height,
                           fps, (uint64_t)generation) ? JNI_TRUE : JNI_FALSE;
 }
