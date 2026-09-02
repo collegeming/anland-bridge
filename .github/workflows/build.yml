@@ -21,7 +21,7 @@ env:
   BUILD_TOOLS_VERSION: "36.0.0"
   NDK_VERSION: "29.0.13113456"
   CMAKE_VERSION: "3.22.1"
-  FEATURE_BASELINE: "95b2d73ff799639ce8576ff908f13f5a31e024a1"
+  FEATURE_BASELINE: "df6069cdc63bb2b53d2d9add1183b216bbaafa25"
   MAGISK_INSTALLER_COMMIT: "a19666d884768a3350dd70b8689da3b87e1d17b0"
   MAGISK_INSTALLER_SHA256: "bcf4b1d9913f3af17755569c853e0b5a75b8005f6a18eb3f86dadcc0e968c29d"
 
@@ -295,7 +295,7 @@ jobs:
           project=collegeming/anland-bridge
           release_tag=TAG_VALUE
           source_commit=SOURCE_VALUE
-          bridge_feature_baseline=95b2d73ff799639ce8576ff908f13f5a31e024a1
+          bridge_feature_baseline=df6069cdc63bb2b53d2d9add1183b216bbaafa25
           workflow_tooling_commit=SOURCE_VALUE
           workflow_run=RUN_VALUE
           android_application_id=com.anland.consumer
