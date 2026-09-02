@@ -1,4 +1,5 @@
 #include <signal.h>
+#include <sys/stat.h>
 
 #include "../libdisplay_daemon/display_daemon.h"
 
@@ -18,6 +19,10 @@ static void handle_signal(int sig)
 int main(int argc, char **argv)
 {
     const char *sock_path = (argc > 1) ? argv[1] : "/data/local/tmp/display_daemon.sock";
+
+    /* Module hosts may run us with umask 0; the broker socket must stay
+     * root-only (all peers connect through root fd handoff anyway). */
+    umask(0077);
 
     if (daemon_create(&g_ctx, sock_path) < 0)
         return 1;

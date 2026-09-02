@@ -31,7 +31,7 @@ Android v5 consumer 的默认输出模式为 `local`、`remote`、`both` 三态�
 
 | 角色 | 程序 | 职责 |
 |------|------|------|
-| **守护进程** | `daemon` | 充当对接中介，最多保存一个 consumer 与一个 producer，缓存屏幕信息，并通过 `SCM_RIGHTS` 在两者间传递文件描述符。**与 V2 相同，无需更新。** |
+| **守护进程** | `daemon` | 充当对接中介，最多保存一个 consumer 与一个 producer，缓存屏幕信息，并通过 `SCM_RIGHTS` 在两者间传递文件描述符。**本仓库已加固（超时、严格 fd 校验），且 hello fd 为 5 个，与上游 daemon 不能混用。** |
 | **消费端** | Android app / `test_sdl_consumer` | 拥有全部资源：分配 dmabuf、buffer‑ready eventfd、shm 索引页与**两条** socketpair（`data` + `fence`），并最终**呈现**已渲染的帧。V3 还负责**接收 producer 发来的剪贴板数据**。 |
 | **生产端** | KWin / Weston `backend‑anland` | 即合成器，把桌面内容**渲染**进 consumer 提供的共享缓冲区。V3 还负责**接收 consumer 发来的剪贴板数据**并**向 consumer 发送剪贴板数据**。 |
 
@@ -49,7 +49,7 @@ Android v5 consumer 的默认输出模式为 `local`、`remote`、`both` 三态�
 | 变长事件 | 未使用 | `clipboard.size` + trailing payload | ❌ **ABI 不兼容**：旧版 `poll_input_event()` 无法排空变长负载，导致流损坏 |
 | `handle_unhandled_event()` | 不需要 | **必须调用** | ❌ **API 不兼容**：未处理的变长事件必须显式排空 |
 | `push_input_event_with_length()` / `push_output_event_with_length()` | 不需要 | **剪贴板必须使用** | 签名不变，但变长事件**不得**用 `push_input_event()` / `push_output_event()` 发送 |
-| 守护进程 | — | **不变** | 零改动 |
+| 守护进程 | — | **本仓库已修改** | hello fd 4 → 5（新增音频槽位），须配套本仓库 daemon |
 
 > [!CAUTION]
 > **ABI 不兼容**: V3 consumer 可能发送 `INPUT_TYPE_CLIPBOARD` 事件，其尾随负载字节超过
@@ -87,9 +87,9 @@ struct data_msg { uint32_t type; uint32_t size; uint8_t payload[]; } __attribute
 
 ---
 
-## 4. 寄存的四个描述符
+## 4. 寄存的五个描述符
 
-consumer 打招呼时通过 `SCM_RIGHTS` 附带**四个** fd，顺序固定如下
+consumer 打招呼时通过 `SCM_RIGHTS` 附带**五个** fd，顺序固定如下
 （见 `display_consumer.c` 的 `send_hello_fds()`）：
 
 | 下标 | 方向 | 用途 |
@@ -98,11 +98,13 @@ consumer 打招呼时通过 `SCM_RIGHTS` 附带**四个** fd，顺序固定如�
 | `fds[1]` | P → C | `fence_fd` socketpair 写端: 渲染完成消息 + 可选 fence fd via `SCM_RIGHTS` |
 | `fds[2]` | C ↔ P | 数据通道: socketpair 的 producer 端 |
 | `fds[3]` | C → P | `shm_fd`: 4 字节索引页 |
+| `fds[4]` | C ↔ P | 音频通道: `SOCK_SEQPACKET` socketpair 的 producer 端（双向 PCM） |
 
-> **V3 无变更**：fd 槽位与 V2 完全相同
+> **本仓库与上游不同**：上游 V3 为 4 个 fd；本仓库新增第 5 个音频槽位，
+> daemon 严格要求 5 个 fd。上游 consumer/producer 与本仓库 daemon **不能混用**。
 
-consumer 自留 `sv[0]` 作为自身 `data_fd`，寄存 `sv[1]`。守护进程把这些保存为
-**deposited fds**，待 producer 请求时转交。**Daemon 不感知 fd 语义，无需更新。**
+consumer 自留各 socketpair 的 `[0]` 端，寄存 `[1]` 端。守护进程把这些保存为
+**deposited fds**，待 producer 请求时转交。**Daemon 不感知 fd 语义。**
 
 ---
 
@@ -481,7 +483,7 @@ stateDiagram-v2
 （见 `display_producer.c`）：
 
 1. **`pickup_fds()`** — 发送 `PICKUP_FDS`，轮询 `ctrl_fd` (100 ms) 等待 `FDS_READY`，
-   收到 4 个 fd 并 `mmap` 索引页。
+   收到 5 个 fd 并 `mmap` 索引页。
 2. **`receive_dmabufs()`** — 轮询 `data_fd` (100 ms) 等待 `BUFS_READY`，保存缓冲区集合。
 
 任意步骤失败 → `release_consumer_resources()` 并留在 fallback，可在下一拍安全重试。

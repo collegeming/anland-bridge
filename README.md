@@ -187,7 +187,7 @@ RDP 端传来的 Linux evdev keycode、鼠标坐标、按键和滚轮通过 `Nat
 
 本次验证使用：
 
-- Java 21；
+- Java 17；
 - Android API 36 / Build Tools 36.0.0；
 - Android NDK `29.0.13113456`；
 - CMake 3.22.1；

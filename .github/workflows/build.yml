@@ -8,7 +8,6 @@ on:
       - "anland-v*"
   workflow_dispatch:
   workflow_call:
-  workflow_call:
 
 concurrency:
   group: anland-android-${{ github.ref }}
@@ -317,7 +316,7 @@ jobs:
           tracy_status=profiling-only
           video_encoder=Android MediaCodec hardware H.264 only; no software fallback
           deployment_boundary=Android host/root only; do not install these assets into Linux RootFS
-          apk_signing=fixed anland release key; upgrade-compatible with prior releases
+          apk_signing=fixed anland release key; upgrade-compatible only with releases signed by the same key (5.19.5+); 5.19.3/5.19.4 used different keys and require uninstall first
           END_META
           sed -i \
             -e "s|TAG_VALUE|$tag|" \
@@ -342,7 +341,7 @@ jobs:
             printf -- '- `SHA256SUMS`, `BUILD-METADATA.txt`, `LICENSE`, and `THIRD-PARTY-NOTICES.txt` authenticate and describe the build.\n\n'
             printf '`testPlainDebugUnitTest` result: `%s`. `NO-SOURCE` means no Java unit tests existed; this Release does not claim otherwise.\n\n' "$test_result"
             printf 'These assets belong on the Android host/root side only and must not be installed in the Linux RootFS. Video encoding is hardware MediaCodec H.264 only, with no software fallback.\n\n'
-            printf 'APKs are signed with the fixed Anland release key and are upgrade-compatible with prior releases.\n'
+            printf 'APKs are signed with the fixed Anland release key and are upgrade-compatible only with releases using the same key (5.19.5+); 5.19.3/5.19.4 used different keys and require uninstall first.\n'
           } > "$RUNNER_TEMP/release-notes.txt"
           (
             cd release
