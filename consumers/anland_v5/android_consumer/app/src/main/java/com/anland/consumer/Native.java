@@ -39,14 +39,9 @@ public final class Native {
                                        String helperPath, String bridgePath) {
         if (handle != 0) {
             nativeConfigure(handle, socketPath, useRoot, helperPath,
-                    bridgePath + "." + Long.toUnsignedString(handoffId));
+                    bridgePath + "." + Long.toUnsignedString(handoffId),
+                    false, null, 1, null);
         }
-    }
-
-    // ---- instance API (delegates to the handle-taking natives) ----
-
-    public void configure(String socketPath, boolean useRoot, String helperPath, String bridgePath) {
-        nativeConfigure(handle, socketPath, useRoot, helperPath, bridgePath, false, null, 1, null);
     }
 
     /** Full configure, including the foreground-scheduling (top-app) helper. */
