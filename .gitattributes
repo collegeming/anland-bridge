@@ -1,0 +1,8 @@
+# Normalize every text file to LF — in the repo and in working trees on all
+# platforms. This repo is built on Linux/Android; CRLF in scripts or sources
+# breaks them. Keep this rule first; add binary exceptions below it.
+* text=auto eol=lf
+
+# Explicit binaries: never EOL-convert, never diff.
+*.png binary
+magisk_module/display_daemon binary
