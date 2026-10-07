@@ -7,6 +7,9 @@ SOCK=/data/local/tmp/display_daemon.sock
 # daemon is alive but the socket vanished we exit anyway; toggle the module to recover.
 pgrep -f display_daemon >/dev/null 2>&1 && exit 0
 
+# Files this script creates stay root-only; the broker socket is exempt, since the
+# compositor reaches it from inside a container as an unprivileged user. The daemon
+# sets that socket's mode itself.
 umask 077
 rm -f "$SOCK"
 "$MODDIR/display_daemon" "$SOCK" &

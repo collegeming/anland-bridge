@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -332,6 +333,15 @@ int daemon_create(daemon_ctx **out, const char *sock_path)
     }
     if (listen(ctx->listen_fd, 4) < 0) {
         perror("listen");
+        daemon_destroy(ctx);
+        return -1;
+    }
+
+    /* The broker socket is bind-mounted into a Droidspaces container, where the
+     * compositor connects as an unprivileged user. The process umask must not
+     * decide reachability of that mount point, so set the mode explicitly. */
+    if (chmod(sock_path, 0666) < 0) {
+        perror("chmod");
         daemon_destroy(ctx);
         return -1;
     }
