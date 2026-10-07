@@ -22,15 +22,6 @@ def gitOutput = { List<String> cmd, String fallback ->
 
 // Short commit id of the source tree the APK was built from.
 def gitCommitId = gitOutput(['git', 'rev-parse', '--short', 'HEAD'], "unknown")
-// Branch the APK was built from, so a build of the Gold branch says so in its
-// version rather than carrying a commit id nobody can place. Empty on a
-// detached HEAD -- which is what CI checks out -- so that case falls back to
-// the commit id, which is still the right answer there.
-def gitBranch = gitOutput(['git', 'branch', '--show-current'], "")
-def gitBuildId = gitBranch.isEmpty() ? gitCommitId : gitBranch
-// Most recent tag reachable from HEAD (e.g. "5.20"), used as the versionName
-// prefix so it tracks releases instead of a hardcoded number.
-def gitTag = gitOutput(['git', 'describe', '--tags', '--abbrev=0'], "unknown")
 // Number of commits reachable from HEAD, used as a monotonic versionCode.
 def gitCommitCount = gitOutput(['git', 'rev-list', '--count', 'HEAD'], "1") as Integer
 // "-dirty" when the working tree has uncommitted changes at build time.
@@ -49,7 +40,7 @@ android {
         minSdk 30
         targetSdk 36
         versionCode gitCommitCount
-        versionName "${gitTag}-${gitBuildId}${gitDirty}"
+        versionName "5.19-${gitCommitId}${gitDirty}"
 
         ndk {
             abiFilters 'arm64-v8a'
