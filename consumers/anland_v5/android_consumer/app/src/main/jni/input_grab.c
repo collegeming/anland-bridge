@@ -29,10 +29,10 @@
  *      (or EOF, which the kernel guarantees when the app dies) releases
  *      everything. The app only heartbeats while its main thread is running, so
  *      an ANR frees the input too.
- *   5. Pure Android hardware-button nodes, and every non-keyboard node that
- *      reports Power, are watched but never grabbed. That preserves Android's
- *      lock/wake path even on panels that expose KEY_POWER alongside contacts.
- *      Full keyboards remain grabbable because their ordinary keys cannot leak.
+ *   5. Android hardware-button nodes stay with Android. A touchscreen that also
+ *      reports Power can be grabbed only while a separate built-in power-button
+ *      node remains available to Android. Otherwise it is listed as watch-only,
+ *      with its real device class preserved.
  */
 #define _GNU_SOURCE
 #include <android/log.h>
@@ -74,6 +74,13 @@
 /* Poll slice; also how often the timeout above is re-checked. */
 #define POLL_SLICE_MS 250
 
+#define GOLD_NAME_PREFIX "Gold Keyboardremaps"
+#define GOLD_VENDOR 0xffff
+#define GOLD_PRODUCT 0xffff
+enum input_source { SOURCE_PHYSICAL, SOURCE_GOLD, SOURCE_COMBINED };
+static enum input_source g_source = SOURCE_PHYSICAL;
+static int selected_physical_node(const char *path);
+
 #define BITS_PER_LONG  (8 * (int)sizeof(unsigned long))
 #define NBITS(x)       ((((x) - 1) / BITS_PER_LONG) + 1)
 #define TEST_BIT(bit, arr) \
@@ -82,8 +89,16 @@
 struct dev_entry {
     int  fd;
     int  cls;        /* IGRAB_CLASS_* */
-    int  grabbed;    /* 0 => watched only (toggle detection), events not forwarded */
+    int  grabbed;    /* 0 =>
+                        watched only (toggle detection), events not forwarded */
+    int  gold;
+    int  waiting_idle; /* finish Android's held keys before taking Gold output */
     int  announced;  /* the app has received this entry's DEVICE record */
+    int  alpha;      /* a full keyboard, not just a node that happens to have keys */
+    int  watch_only; /* classified as tracked-but-never-grabbed */
+    int  power;      /* advertises KEY_POWER or KEY_POWER2 */
+    int  power_button; /* a separate built-in, key-only power-button node */
+    unsigned int bus; /* bustype: how the device is attached, e.g. USB / Bluetooth */
     int  multitouch;
     int  clickpad;   /* one button under the pad: BTN_LEFT alone means "a click" */
     int  min_x, max_x, min_y, max_y;
@@ -92,6 +107,7 @@ struct dev_entry {
 
 static struct dev_entry g_devs[IGRAB_MAX_DEVICES];
 static int g_ndevs = 0;
+static int g_has_power_button = 0;
 static volatile sig_atomic_t g_quit = 0;
 
 static void on_signal(int sig)
@@ -152,6 +168,22 @@ static void release_all(void)
         g_devs[i].fd = -1;
     }
     g_ndevs = 0;
+}
+
+static int pending_gold(void)
+{
+    for (int i = 0; i < g_ndevs; i++)
+        if (g_devs[i].fd >= 0 && g_devs[i].waiting_idle)
+            return 1;
+    return 0;
+}
+
+static int has_gold_output(void)
+{
+    for (int i = 0; i < g_ndevs; i++)
+        if (g_devs[i].fd >= 0 && g_devs[i].gold)
+            return 1;
+    return 0;
 }
 
 /* ---------------- record transport ---------------- */
@@ -305,11 +337,7 @@ static int any_key_bit(const unsigned long *key)
     return 0;
 }
 
-/* A full keyboard is allowed to advertise KEY_POWER: many docks expose that
- * capability on their ordinary keyboard node while the tablet's real power
- * switch is a separate node. Non-keyboard nodes have no safe way to split one
- * evdev fd after EVIOCGRAB, so a Power-bearing panel/mouse/controller stays
- * watch-only and Android retains its lock/wake path. */
+/* Full keyboards may advertise KEY_POWER alongside their ordinary keys. */
 static int has_alpha_keys(const unsigned long *key)
 {
     static const int letters[] = {
@@ -366,54 +394,103 @@ static int has_only_physical_android_keys(const unsigned long *key)
     return any;
 }
 
-static void read_abs_range(int fd, int axis, int *min, int *max)
+static int query_input(int fd, unsigned long request, void *data)
 {
-    struct input_absinfo info;
-    if (ioctl(fd, EVIOCGABS(axis), &info) == 0 && info.maximum > info.minimum) {
-        *min = info.minimum;
-        *max = info.maximum;
-    }
+    int result;
+    do {
+        result = ioctl(fd, request, data);
+    } while (result < 0 && errno == EINTR);
+    return result;
 }
 
-/*
- * Open one /dev/input node and decide what it is. Returns 0 when the node was
- * taken (entry filled in, fd owned by the caller), -1 when it was skipped.
- *
- * Classification is by capability bits, never by event number: the numbering
- * shifts as soon as a keyboard or dock is attached.
- */
-static int inspect_device(const char *path, struct dev_entry *out)
+static int read_capabilities(int fd, const char *path, int type, void *bits, size_t size)
+{
+    if (query_input(fd, EVIOCGBIT(type, size), bits) >= 0)
+        return 0;
+    LOGE("%s: EVIOCGBIT(%d) failed: %s", path, type, strerror(errno));
+    return -1;
+}
+
+static void read_abs_range(int fd, const char *path, int axis, int *min, int *max)
+{
+    struct input_absinfo info;
+    if (query_input(fd, EVIOCGABS(axis), &info) < 0) {
+        LOGE("%s: EVIOCGABS(%#x) failed: %s", path, axis, strerror(errno));
+        return;
+    }
+    if (info.maximum <= info.minimum) {
+        LOGE("%s: invalid axis %#x range %d..%d", path, axis,
+             info.minimum, info.maximum);
+        return;
+    }
+    *min = info.minimum;
+    *max = info.maximum;
+}
+
+static int is_builtin_bus(unsigned int bus)
+{
+    return bus == 0 || bus == BUS_HOST || bus == BUS_I8042
+            || bus == BUS_I2C || bus == BUS_SPI;
+}
+
+/* Preserve Android's matching key releases before switching the output owner. */
+static int grab_idle_gold(struct dev_entry *entry)
+{
+    unsigned long held[NBITS(KEY_MAX + 1)] = {0};
+    if (query_input(entry->fd, EVIOCGKEY(sizeof(held)), held) < 0)
+        return -1;
+    for (size_t i = 0; i < sizeof(held) / sizeof(held[0]); i++)
+        if (held[i])
+            return 0;
+    if (ioctl(entry->fd, EVIOCGRAB, 1) < 0)
+        return -1;
+    entry->grabbed = 1;
+    entry->waiting_idle = 0;
+    return 1;
+}
+
+/* Classify by capabilities and identity, then take only the requested source. */
+static int inspect_device(const char *path, struct dev_entry *out, int do_grab)
 {
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0)
+    if (fd < 0) {
+        LOGE("open(%s) failed: %s", path, strerror(errno));
         return -1;
+    }
 
-    unsigned long ev[NBITS(EV_MAX)];
-    unsigned long key[NBITS(KEY_MAX)];
-    unsigned long abs[NBITS(ABS_MAX)];
-    unsigned long rel[NBITS(REL_MAX)];
-    unsigned long prop[NBITS(INPUT_PROP_MAX)];
+    unsigned long ev[NBITS(EV_MAX + 1)];
+    unsigned long key[NBITS(KEY_MAX + 1)];
+    unsigned long abs[NBITS(ABS_MAX + 1)];
+    unsigned long rel[NBITS(REL_MAX + 1)];
+    unsigned long prop[NBITS(INPUT_PROP_MAX + 1)];
     memset(ev, 0, sizeof(ev));
     memset(key, 0, sizeof(key));
     memset(abs, 0, sizeof(abs));
     memset(rel, 0, sizeof(rel));
     memset(prop, 0, sizeof(prop));
 
-    if (ioctl(fd, EVIOCGBIT(0, sizeof(ev)), ev) < 0) {
+    if (read_capabilities(fd, path, 0, ev, sizeof(ev)) < 0
+            || (TEST_BIT(EV_KEY, ev)
+                && read_capabilities(fd, path, EV_KEY, key, sizeof(key)) < 0)
+            || (TEST_BIT(EV_ABS, ev)
+                && read_capabilities(fd, path, EV_ABS, abs, sizeof(abs)) < 0)
+            || (TEST_BIT(EV_REL, ev)
+                && read_capabilities(fd, path, EV_REL, rel, sizeof(rel)) < 0)) {
         close(fd);
         return -1;
     }
-    if (TEST_BIT(EV_KEY, ev))
-        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key)), key);
-    if (TEST_BIT(EV_ABS, ev))
-        ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs)), abs);
-    if (TEST_BIT(EV_REL, ev))
-        ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rel)), rel);
-    ioctl(fd, EVIOCGPROP(sizeof(prop)), prop);
+    /* Older drivers may not expose properties; contact capabilities still let
+     * us classify them. Required capability queries above must not silently
+     * turn a failed touch-axis query into an apparently valid button node. */
+    if (query_input(fd, EVIOCGPROP(sizeof(prop)), prop) < 0) {
+        LOGI("%s: input properties unavailable (%s); using contact capabilities",
+             path, strerror(errno));
+        memset(prop, 0, sizeof(prop));
+    }
 
     memset(out, 0, sizeof(*out));
     out->fd = fd;
-    if (ioctl(fd, EVIOCGNAME(sizeof(out->name)), out->name) < 0)
+    if (query_input(fd, EVIOCGNAME(sizeof(out->name)), out->name) < 0)
         out->name[0] = '\0';
     out->name[sizeof(out->name) - 1] = '\0';
 
@@ -424,32 +501,41 @@ static int inspect_device(const char *path, struct dev_entry *out)
     int pointer = TEST_BIT(INPUT_PROP_POINTER, prop);
     int touch   = TEST_BIT(BTN_TOUCH, key);
     int click   = TEST_BIT(BTN_LEFT, key);
-    int pen     = TEST_BIT(BTN_TOOL_PEN, key) || TEST_BIT(BTN_STYLUS, key);
+    int pen     = TEST_BIT(BTN_TOOL_PEN, key) || TEST_BIT(BTN_STYLUS, key)
+            || TEST_BIT(BTN_TOOL_RUBBER, key);
+    int finger  = TEST_BIT(BTN_TOOL_FINGER, key);
     int alpha   = has_alpha_keys(key);
     int power   = has_power_key(key);
-    int keys    = any_key_bit(key);
+    out->alpha = alpha;
+    out->power = power;
 
-    /* A stylus digitizer overlaps the panel; forwarding it as a second finger
-     * only confuses the gesture engine, and its barrel keys are useless here. */
-    if (pen) {
+    /* How the device is attached. The same keyboard can be offered over more
+     * than one transport, and which one it is tells the user which node is the
+     * one they are actually typing on. */
+    struct input_id id;
+    int have_id = query_input(fd, EVIOCGID, &id) == 0;
+    if (have_id)
+        out->bus = id.bustype;
+    out->gold = have_id && id.vendor == GOLD_VENDOR && id.product == GOLD_PRODUCT &&
+            strncmp(out->name, GOLD_NAME_PREFIX, sizeof(GOLD_NAME_PREFIX) - 1) == 0;
+    if (out->gold && g_source == SOURCE_PHYSICAL) {
+        close(fd);
+        return -1;
+    }
+    int keys    = any_key_bit(key);
+    out->power_button = power && !alpha && have_id && is_builtin_bus(out->bus)
+            && !TEST_BIT(EV_ABS, ev) && !TEST_BIT(EV_REL, ev);
+
+    /* Skip a pen-only digitizer, but keep nodes that also carry finger contacts.
+     * Shared pen/touch nodes are decoded by tool type on the app side. */
+    if (pen && !mt && !finger) {
         close(fd);
         return -1;
     }
 
-    /* A single EVIOCGRAB applies to the whole node. Do not take a touchscreen,
-     * touchpad, mouse or consumer-control node that carries Power: forwarding
-     * its KEY_POWER to the desktop cannot make Android lock the device, so the
-     * ACTION_SCREEN_OFF safety receiver would never run. Full keyboards retain
-     * the existing exception above because their ordinary keys must not leak. */
-    if (power && !alpha) {
-        out->cls = IGRAB_CLASS_KEYBOARD;
-        out->grabbed = 0;
-        return 0;
-    }
-
     /* Contacts, not axes: a gamepad also reports ABS_X/ABS_Y, and its sticks
      * must not be mistaken for a finger. */
-    int contacts = mt || (abs_xy && (direct || pointer || touch));
+    int contacts = mt || (abs_xy && (direct || pointer || touch || finger));
 
     if (contacts) {
         /* The property bits say it outright when they are set. Panels that set
@@ -464,16 +550,6 @@ static int inspect_device(const char *path, struct dev_entry *out)
     } else if (rel_xy) {
         out->cls = IGRAB_CLASS_MOUSE;
     } else if (keys) {
-        /* Physical Android buttons must remain available to Android while
-         * immersive mode is active. Keep these fds open watch-only so the bound
-         * toggle key can still release the session, but do not EVIOCGRAB them.
-         * Non-keyboard Power nodes returned above; this path protects the rest
-         * of the dedicated Android button devices. */
-        if (has_only_physical_android_keys(key)) {
-            out->cls = IGRAB_CLASS_KEYBOARD;
-            out->grabbed = 0;
-            return 0;
-        }
         out->cls = IGRAB_CLASS_KEYBOARD;
     } else {
         close(fd);
@@ -489,25 +565,60 @@ static int inspect_device(const char *path, struct dev_entry *out)
             || (click && !TEST_BIT(BTN_RIGHT, key));
     if (out->cls == IGRAB_CLASS_TOUCHSCREEN || out->cls == IGRAB_CLASS_TOUCHPAD) {
         if (mt) {
-            read_abs_range(fd, ABS_MT_POSITION_X, &out->min_x, &out->max_x);
-            read_abs_range(fd, ABS_MT_POSITION_Y, &out->min_y, &out->max_y);
+            read_abs_range(fd, path, ABS_MT_POSITION_X, &out->min_x, &out->max_x);
+            read_abs_range(fd, path, ABS_MT_POSITION_Y, &out->min_y, &out->max_y);
         }
         /* Single-touch panels only have ABS_X/ABS_Y; multitouch ones still use
          * them as a fallback when the MT axes report nothing usable. */
-        if (out->max_x <= out->min_x)
-            read_abs_range(fd, ABS_X, &out->min_x, &out->max_x);
-        if (out->max_y <= out->min_y)
-            read_abs_range(fd, ABS_Y, &out->min_y, &out->max_y);
+        if (out->max_x <= out->min_x && TEST_BIT(ABS_X, abs))
+            read_abs_range(fd, path, ABS_X, &out->min_x, &out->max_x);
+        if (out->max_y <= out->min_y && TEST_BIT(ABS_Y, abs))
+            read_abs_range(fd, path, ABS_Y, &out->min_y, &out->max_y);
         if (out->max_x <= out->min_x || out->max_y <= out->min_y) {
+            LOGE("%s '%s': no usable touch coordinate range", path, out->name);
             close(fd);
             return -1;
         }
     }
 
+    /* Some panels advertise KEY_POWER for screen-off gestures. That does not
+     * make them keyboards. They can be taken while a separate built-in power
+     * button stays with Android; otherwise retain their class and report the
+     * restriction so Settings can explain it instead of hiding the panel. */
+    out->watch_only = !out->gold && ((power && !alpha
+            && !(out->cls == IGRAB_CLASS_TOUCHSCREEN && g_has_power_button))
+            || (out->cls == IGRAB_CLASS_KEYBOARD && has_only_physical_android_keys(key)));
+
+    if (do_grab && !out->gold &&
+            (g_source == SOURCE_GOLD || !selected_physical_node(path) ||
+             (g_source == SOURCE_COMBINED && out->cls == IGRAB_CLASS_KEYBOARD &&
+              !out->watch_only))) {
+        close(fd);
+        return -1;
+    }
+
+    if (!do_grab || out->watch_only) {
+        /* Enumeration or a protected node. The caller owns this fd, but Android
+         * keeps receiving its events. */
+        out->grabbed = 0;
+        return 0;
+    }
+
+    if (out->gold) {
+        /* These are already remapped events. Taking the output leaves Gold's
+         * physical grab and Anland profile intact, while Android gets no keys.
+         * If the entry key is still held, let its UP reach Android first. */
+        out->waiting_idle = 1;
+        if (grab_idle_gold(out) >= 0)
+            return 0;
+        close(fd);
+        return -1;
+    }
+
     if (ioctl(fd, EVIOCGRAB, 1) < 0) {
         /* Someone else already owns it exclusively. Watching it would double up
          * with Android's own delivery, so let it go entirely. */
-        LOGE("grab '%s' failed: %s", out->name, strerror(errno));
+        LOGE("grab %s '%s' failed: %s", path, out->name, strerror(errno));
         close(fd);
         return -1;
     }
@@ -515,8 +626,237 @@ static int inspect_device(const char *path, struct dev_entry *out)
     return 0;
 }
 
+/* ---------------- node names the caller asked to keep or leave alone -------- */
+
+#define IGRAB_NODE_NAME_MAX 16
+#define IGRAB_MAX_NODE_ARG 32
+
+struct node_list {
+    char names[IGRAB_MAX_NODE_ARG][IGRAB_NODE_NAME_MAX];
+    int count;
+};
+
+static struct node_list g_selected;   /* nodes= ...; empty means "auto" */
+static struct node_list g_excluded;   /* exclude= ... */
+
+/*
+ * "event" followed by digits. The strict form is the grammar Gold itself emits
+ * and admits no leading zeros beyond the bare "event0"; the loose form is what a
+ * preference saved by an older build may contain, so "event01" is still legal
+ * there.
+ */
+static int valid_node_name(const char *name, int strict)
+{
+    if (strncmp(name, "event", 5) != 0)
+        return 0;
+    const char *digits = name + 5;
+    if (*digits == '\0')
+        return 0;
+    if (strict && digits[0] == '0')
+        return digits[1] == '\0';
+    for (const char *p = digits; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9')
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * Parses a comma separated node list. Returns 0 on success, -1 when the argument
+ * is not one we are willing to act on: an empty list means "not given", and a
+ * repeated name is refused rather than silently collapsed.
+ */
+static int parse_node_argument(const char *value, struct node_list *out, int strict)
+{
+    out->count = 0;
+    if (value == NULL || *value == '\0')
+        return 0;
+
+    const char *cursor = value;
+    for (;;) {
+        const char *comma = strchr(cursor, ',');
+        size_t length = comma ? (size_t)(comma - cursor) : strlen(cursor);
+        if (length == 0 || length >= IGRAB_NODE_NAME_MAX)
+            return -1;
+        char name[IGRAB_NODE_NAME_MAX];
+        memcpy(name, cursor, length);
+        name[length] = '\0';
+
+        if (!valid_node_name(name, strict) || out->count >= IGRAB_MAX_NODE_ARG)
+            return -1;
+        for (int i = 0; i < out->count; i++) {
+            if (strcmp(out->names[i], name) == 0)
+                return -1;
+        }
+        memcpy(out->names[out->count], name, length + 1);
+        out->count++;
+
+        if (comma == NULL)
+            return 0;
+        cursor = comma + 1;
+    }
+}
+
+static int node_list_contains(const struct node_list *list, const char *name)
+{
+    for (int i = 0; i < list->count; i++) {
+        if (strcmp(list->names[i], name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Look for a separate built-in power button before deciding whether a panel's
+ * gesture KEY_POWER is a reason to leave it alone. Selection limits grabs, but
+ * an unselected power button still protects Android. Explicit exclusions are
+ * respected even during this read-only probe (Gold may own those devices).
+ * USB, Bluetooth and virtual power keys cannot stand in for the physical button.
+ */
+static void refresh_power_button(void)
+{
+    g_has_power_button = 0;
+    DIR *dir = opendir("/dev/input");
+    if (!dir)
+        return;
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, "event", 5) != 0
+                || node_list_contains(&g_excluded, ent->d_name))
+            continue;
+        char path[300];
+        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+        struct dev_entry entry;
+        if (inspect_device(path, &entry, 0) < 0)
+            continue;
+        int power_button = entry.power_button;
+        close(entry.fd);
+        if (power_button) {
+            g_has_power_button = 1;
+            break;
+        }
+    }
+    closedir(dir);
+}
+
+/*
+ * Whether a node belongs in the session. Excluded nodes are never opened or
+ * inspected, including by the power-button probe. Unselected nodes may be
+ * probed but are never grabbed, announced or assigned a device slot.
+ *
+ * An empty selection means "auto" -- take whatever is capable, as before.
+ */
+static int node_is_allowed(const char *name)
+{
+    if (node_list_contains(&g_excluded, name))
+        return 0;
+    if (g_source != SOURCE_COMBINED && g_selected.count > 0 &&
+            !node_list_contains(&g_selected, name))
+        return 0;
+    return 1;
+}
+
+static int selected_physical_node(const char *path)
+{
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    return g_selected.count == 0 || node_list_contains(&g_selected, name);
+}
+
+/*
+ * Whether a node is one of the input devices a session actually wants: a
+ * keyboard, a pointer, a touch surface.
+ *
+ * A node that merely carries a few buttons -- a powerkey, a headset jack, or the
+ * media strip a modern keyboard exposes as its own HID collection -- is not one.
+ * Grabbing it would take the device's own volume and brightness keys away from
+ * Android for the whole session and give nothing back: those keys are not
+ * something a desktop wants forwarded while the user is trying to change the
+ * volume of the tablet in their hands.
+ *
+ * Consulted only when the caller named no nodes of its own; an explicit
+ * selection is the caller's business, not this function's.
+ */
+static int node_is_common_input(const struct dev_entry *entry)
+{
+    if (entry->gold)
+        return 1;
+    if (entry->watch_only)
+        return 0;
+    /* Classified as a keyboard but carrying no letters: a button cluster. */
+    if (entry->cls == IGRAB_CLASS_KEYBOARD && !entry->alpha)
+        return 0;
+    return 1;
+}
+
+/* Give back a node inspect_device opened (and maybe grabbed) that we decided
+ * not to keep. Releasing the grab before closing shortens the window in which
+ * Android cannot see the device. */
+static void drop_inspected(struct dev_entry *entry)
+{
+    if (entry->fd < 0)
+        return;
+    if (entry->grabbed)
+        ioctl(entry->fd, EVIOCGRAB, 0);
+    close(entry->fd);
+    entry->fd = -1;
+    entry->grabbed = 0;
+}
+
+/*
+ * Enumerates every input node and prints one line each. Nothing is grabbed and
+ * the caller's selection is ignored: Settings has to be able to show a node even
+ * when a session has been told to leave it alone.
+ */
+static int list_devices(void)
+{
+    refresh_power_button();
+    DIR *dir = opendir("/dev/input");
+    if (!dir) {
+        LOGE("opendir(/dev/input): %s", strerror(errno));
+        return 1;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, "event", 5) != 0)
+            continue;
+        char path[300];
+        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+
+        struct dev_entry entry;
+        if (inspect_device(path, &entry, 0) < 0)
+            continue;
+        /* node, human name, class, bustype, flags. The app splits on tabs, and
+         * the helper ships inside the same APK as the app that reads it, so the
+         * two are always the same version and there is no older shape to keep
+         * working with.
+         *
+         * The flags are what stop the list from lying: without them every node
+         * that merely carries a few keys reports the same class as a real
+         * keyboard, and "gpio-keys" would be offered as a keyboard alongside the
+         * one the user actually types on.
+         *   a = has a full set of letter keys (a keyboard, not a button node)
+         *   w = classified watch-only, so a session never grabs it */
+        char flags[3];
+        int next = 0;
+        if (entry.alpha)
+            flags[next++] = 'a';
+        if (entry.watch_only)
+            flags[next++] = 'w';
+        flags[next] = '\0';
+        printf("%s\t%s\t%d\t%04x\t%s\n", ent->d_name, entry.name, entry.cls,
+               entry.bus, next == 0 ? "-" : flags);
+        fflush(stdout);
+        close(entry.fd);
+    }
+    closedir(dir);
+    return 0;
+}
+
 static int scan_devices(void)
 {
+    refresh_power_button();
     DIR *dir = opendir("/dev/input");
     if (!dir) {
         LOGE("opendir(/dev/input): %s", strerror(errno));
@@ -528,10 +868,20 @@ static int scan_devices(void)
     while ((ent = readdir(dir)) != NULL && g_ndevs < IGRAB_MAX_DEVICES) {
         if (strncmp(ent->d_name, "event", 5) != 0)
             continue;
+        /* Decided from the name, before the node is opened, so a node we were
+         * told to leave alone costs nothing and takes no slot. */
+        if (!node_is_allowed(ent->d_name))
+            continue;
         char path[300];
         snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
-        if (inspect_device(path, &g_devs[g_ndevs]) < 0)
+        if (inspect_device(path, &g_devs[g_ndevs], 1) < 0)
             continue;
+        if (g_selected.count == 0 && !node_is_common_input(&g_devs[g_ndevs])) {
+            /* Auto-selection does not want it. Closing releases any grab
+             * inspect_device took, and nothing was announced or slotted. */
+            drop_inspected(&g_devs[g_ndevs]);
+            continue;
+        }
         LOGI("%s '%s' class=%d %s", path, g_devs[g_ndevs].name,
              g_devs[g_ndevs].cls, g_devs[g_ndevs].grabbed ? "GRABBED" : "watch-only");
         if (g_devs[g_ndevs].grabbed)
@@ -640,15 +990,30 @@ static int has_unannounced_devices(void)
  * start, a DEVICE record announces them to the app, and the toggle key is
  * watched on them like on everything else.
  */
-static void scan_new_devices(void)
+static int scan_new_devices(void)
 {
+    refresh_power_button();
+    if (!g_has_power_button) {
+        for (int i = 0; i < g_ndevs; i++) {
+            const struct dev_entry *entry = &g_devs[i];
+            if (entry->fd >= 0 && entry->grabbed && entry->power && !entry->alpha
+                    && entry->cls == IGRAB_CLASS_TOUCHSCREEN) {
+                LOGE("power-button path disappeared; releasing '%s'", entry->name);
+                return -1;
+            }
+        }
+    }
     DIR *dir = opendir("/dev/input");
     if (!dir)
-        return;
+        return 0;
 
     struct dirent *ent;
     while ((ent = readdir(dir)) != NULL) {
         if (strncmp(ent->d_name, "event", 5) != 0)
+            continue;
+        /* Same rule as the initial scan: a node the caller left out is never
+         * opened, so a device plugged in later cannot slip past the selection. */
+        if (!node_is_allowed(ent->d_name))
             continue;
         char path[300];
         snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
@@ -661,8 +1026,14 @@ static void scan_new_devices(void)
             break;
 
         struct dev_entry de;
-        if (inspect_device(path, &de) < 0)
+        if (inspect_device(path, &de, 1) < 0)
             continue;   /* uninteresting, ungrabbable, or already grabbed by us */
+        if (g_selected.count == 0 && !node_is_common_input(&de)) {
+            /* Same rule as the initial scan: a device plugged in later must not
+             * slip past it. Nothing was slotted or announced yet. */
+            drop_inspected(&de);
+            continue;
+        }
         g_devs[idx] = de;
         if (idx == g_ndevs)
             g_ndevs++;
@@ -670,6 +1041,7 @@ static void scan_new_devices(void)
              de.grabbed ? "GRABBED (awaiting DEVICE)" : "watch-only (awaiting DEVICE)");
     }
     closedir(dir);
+    return 0;
 }
 
 static int send_device_list(int sock, int grabbed)
@@ -717,6 +1089,15 @@ static int pump_device(int sock, int idx, int toggle)
         }
         if (n == 0)
             return -2;      /* would otherwise spin: poll keeps reporting POLLIN */
+
+        if (g_devs[idx].waiting_idle) {
+            int ready = grab_idle_gold(&g_devs[idx]);
+            if (ready < 0)
+                return -2;
+            if (ready > 0)
+                g_devs[idx].announced = 0;
+            return 1; /* this batch belonged to Android before the grab */
+        }
 
         int count = (int)(n / (ssize_t)sizeof(struct input_event));
         for (int i = 0; i < count; i++) {
@@ -777,17 +1158,52 @@ static int pump_device(int sock, int idx, int toggle)
 
 int main(int argc, char **argv)
 {
+    /* Enumeration mode: no socket, no toggle, and nothing grabbed. Used by
+     * Settings, which has to list every node without disturbing a session. */
+    if (argc >= 2 && strcmp(argv[1], "--list") == 0)
+        return list_devices();
+
     if (argc < 3) {
-        LOGE("usage: %s <bridge_socket> <toggle_scancode>", argv[0]);
+        LOGE("usage: %s <bridge_socket> <toggle_scancode> [nodes=...] [exclude=...]",
+             argv[0]);
         return 1;
     }
 
     const char *bridge = argv[1];
     int toggle = atoi(argv[2]);
-    /* A session with no way out is never started: the toggle key is the only
-     * thing that guarantees the user can hand the input back. */
-    if (toggle <= 0 || toggle > KEY_MAX) {
-        LOGE("refusing to grab without a valid toggle scancode (%d)", toggle);
+    /* Everything past the toggle is a keyword argument. Unknown ones are
+     * ignored so a newer app can talk to an older helper built before they
+     * existed. A malformed list is refused outright: silently dropping a bad
+     * exclusion would hand a node to this session that the caller believes it
+     * kept away. */
+    for (int i = 3; i < argc; i++) {
+        if (strncmp(argv[i], "nodes=", 6) == 0) {
+            if (parse_node_argument(argv[i] + 6, &g_selected, 0) != 0) {
+                LOGE("refusing invalid nodes argument: %s", argv[i] + 6);
+                return 2;
+            }
+        } else if (strncmp(argv[i], "exclude=", 8) == 0) {
+            if (parse_node_argument(argv[i] + 8, &g_excluded, 1) != 0) {
+                LOGE("refusing invalid exclude argument: %s", argv[i] + 8);
+                return 2;
+            }
+        } else if (strncmp(argv[i], "source=", 7) == 0) {
+            if (strcmp(argv[i] + 7, "gold") == 0)
+                g_source = SOURCE_GOLD;
+            else if (strcmp(argv[i] + 7, "combined") == 0)
+                g_source = SOURCE_COMBINED;
+            else if (strcmp(argv[i] + 7, "physical") == 0)
+                g_source = SOURCE_PHYSICAL;
+            else
+                return 2;
+        }
+    }
+
+    /* Gold-only leaves touch, Android gestures and hardware buttons available.
+     * It can auto-enter without a binding; EOF, heartbeat and screen-off still
+     * release it. Taking physical touch always requires an escape key. */
+    if (toggle < 0 || toggle > KEY_MAX || (toggle == 0 && g_source != SOURCE_GOLD)) {
+        LOGE("refusing invalid toggle scancode (%d)", toggle);
         return 2;
     }
 
@@ -811,7 +1227,8 @@ int main(int argc, char **argv)
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     int grabbed = scan_devices();
-    if (grabbed <= 0) {
+    if ((grabbed <= 0 && !pending_gold()) ||
+            (g_source != SOURCE_PHYSICAL && !has_gold_output())) {
         LOGE("no grabbable input devices");
         send_bye(sock, IGRAB_BYE_ERROR);
         release_all();
@@ -901,7 +1318,10 @@ int main(int argc, char **argv)
          * locally until announce_pending_devices() has put its DEVICE record on
          * the stream, so Android and the desktop can never both own it. */
         if (now_ms() - last_scan > RESCAN_INTERVAL_MS) {
-            scan_new_devices();
+            if (scan_new_devices() < 0) {
+                reason = IGRAB_BYE_ERROR;
+                break;
+            }
             last_scan = now_ms();
         }
 
@@ -963,7 +1383,7 @@ int main(int argc, char **argv)
             if (g_devs[i].fd >= 0 && g_devs[i].grabbed)
                 alive++;
         }
-        if (alive == 0) {
+        if (alive == 0 && !pending_gold() && g_source != SOURCE_GOLD) {
             LOGI("all grabbed devices are gone; ending session");
             reason = IGRAB_BYE_ERROR;
             break;

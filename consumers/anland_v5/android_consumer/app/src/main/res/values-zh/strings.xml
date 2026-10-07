@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="settings_short_label">设置</string>
-
     <!-- Titles / section headers -->
     <string name="settings_title">设置</string>
     <string name="section_virtual_keyboard">软键盘切换键</string>
@@ -11,18 +10,16 @@
     <string name="section_connection">连接</string>
     <string name="section_resolution">显示分辨率</string>
     <string name="section_notification">设置通知</string>
-
     <!-- Settings home: category rows and back navigation -->
     <string name="nav_back">‹ 返回</string>
     <string name="cat_keyboard_title">键盘与按键</string>
-    <string name="cat_keyboard_subtitle">按键绑定、沉浸模式、无障碍与扩展按键栏</string>
+    <string name="cat_keyboard_subtitle">按键绑定、无障碍与扩展按键栏</string>
     <string name="cat_touchpad_title">触摸板与鼠标</string>
     <string name="cat_touchpad_subtitle">触摸板模式、指针捕获与灵敏度</string>
     <string name="cat_connection_subtitle">套接字、root、麦克风、摄像头与音频延迟</string>
     <string name="cat_resolution_subtitle">输出分辨率与预设</string>
     <string name="cat_general_title">通用</string>
     <string name="cat_general_subtitle">屏幕方向与设置通知</string>
-
     <!-- Screen orientation -->
     <string name="section_orientation">屏幕方向</string>
     <string name="orientation_label">强制屏幕方向</string>
@@ -31,7 +28,6 @@
         <item>强制横屏</item>
         <item>强制竖屏</item>
     </string-array>
-
     <!-- Bind key -->
     <string name="bind_key_button">绑定软键盘切换键</string>
     <string name="raise_desktop_for_soft_keyboard">软键盘弹出时抬起桌面</string>
@@ -42,11 +38,12 @@
     <string name="status_current_no_scancode">当前：%1$s —— 该按键不上报扫描码，沉浸模式无法使用它。请改绑音量+等硬件按键。</string>
     <string name="keycode_unknown">键码 %1$d</string>
     <string name="scancode_unknown">扫描码 %1$d</string>
-
     <!-- Immersive mode -->
-    <string name="section_immersive">沉浸模式(实验性)</string>
-    <string name="immersive_switch">启用沉浸模式(实验性)</string>
+    <string name="section_immersive">沉浸模式</string>
+    <string name="immersive_switch">启用沉浸模式</string>
     <string name="immersive_hint">将触摸、键盘和鼠标等输入直接交给 Linux 桌面，避免 Android 系统手势干扰。需要 root。在下方设置切换按键：按一次进入，再按一次退出；切换到其他应用时会自动退出。</string>
+    <string name="immersive_oplus_refresh_rate_switch">固定 OnePlus 高刷新率</string>
+    <string name="immersive_oplus_refresh_rate_hint">解决某些 OnePlus 设备接收不到输入事件导致的刷新率降低</string>
     <string name="bind_immersive_key_button">绑定沉浸模式按键</string>
     <string name="immersive_entering">已进入沉浸模式：所有输入交给桌面，再按一次 %1$s 退出</string>
     <string name="immersive_exited">已退出沉浸模式</string>
@@ -54,11 +51,58 @@
     <string name="immersive_failed">无法进入沉浸模式：root 被拒绝或不可用</string>
     <string name="immersive_no_devices">无法进入沉浸模式：没有可接管的输入设备</string>
     <string name="immersive_interrupted">沉浸模式已结束，输入已交还安卓</string>
+    <string name="immersive_entering_mode">已进入沉浸模式：%1$s</string>
 
+    <string name="immersive_gold_unknown">无法确认 Gold 占用了哪些设备，将在不去避让的情况下启动</string>
+    <string name="immersive_selection_invalid">已保存的设备选择无效，请在“沉浸输入”设置中修正</string>
+    <string name="immersive_selection_filtered">所选设备全部由 Gold 占用，没有可接管的设备</string>
+    <!-- Immersive input sources -->
+    <string name="cat_immersive_title">沉浸模式</string>
+    <string name="cat_immersive_subtitle">全屏输入控制、切换按键与输入来源</string>
+    <string name="immersive_inputs_title">沉浸输入</string>
+    <string name="immersive_inputs_subtitle">选择沉浸模式从哪里获取输入</string>
+    <string name="section_immersive_inputs_source">输入来源</string>
+    <string name="section_immersive_inputs_direct">要接管的 event 节点</string>
+    <string name="section_immersive_inputs_scope">覆盖范围</string>
+
+    <string name="immersive_inputs_direct_blurb">当前：Anland 自己接管物理 event 节点，接管期间安卓看不到这些设备。需要 root。</string>
+    <string name="immersive_inputs_bus_hint">Gold 按配置重映射键盘，Anland 独占其输出并直接送入桌面。</string>
+    <string name="immersive_inputs_combined_hint">Anland 同时接管触摸、指针和 Gold 重映射后的键盘输出。</string>
+    <string name="immersive_inputs_bus_scope">需要 root 和 Gold Keyboard Remaps 模块。沉浸期间，重映射后的全部键盘按键（包括 Meta 和系统快捷键）直接送入桌面。触摸、鼠标和安卓手势仍可使用；离开 App 或锁屏时归还键盘。</string>
+    <string name="immersive_inputs_direct_hint">只有下面勾选的设备会被接管。Gold 已确认占用的设备会显示，但无法选择。</string>
+    <string name="immersive_inputs_auto">自动选择设备</string>
+    <string-array name="immersive_source_options">
+        <item>Anland 接管设备（直连）</item>
+        <item>Gold 键盘直连桌面</item>
+        <item>触摸、指针直连 + Gold 键盘</item>
+    </string-array>
+    <string name="immersive_source_unavailable">需要 Gold Keyboard Remaps 模块，当前未安装或未运行</string>
+    <string name="immersive_auto_enter">自动进入沉浸模式</string>
+    <string name="immersive_auto_enter_hint">App 回到前台时自动将 Gold 键盘交给桌面，触摸和安卓手势仍可使用。</string>
+    <string name="immersive_inputs_loading">正在检查设备…</string>
+    <string name="immersive_inputs_found">Gold 占用的设备会显示，但无法选择。</string>
+    <string name="immersive_inputs_unknown">无法确认 Gold 占用了哪些设备，因此没有标记任何设备为已占用。这里没有任何设备可以确定是空闲的。</string>
+    <string name="immersive_inputs_occupied">✕ %1$s — 由 Gold 占用</string>
+    <string name="immersive_inputs_system_power">✕ %1$s — 为保留电源键控制，交由安卓处理</string>
+    <string name="device_class_keyboard">键盘</string>
+    <string name="device_class_keys">按键节点</string>
+    <string name="device_class_mouse">鼠标</string>
+    <string name="device_class_touchpad">触摸板</string>
+    <string name="device_class_touchscreen">触摸屏</string>
+    <string name="bus_usb">USB</string>
+    <string name="bus_bluetooth">蓝牙</string>
+    <string name="bus_builtin">内置</string>
+    <string name="bus_virtual">虚拟</string>
+    <string name="bus_i2c">I2C</string>
+    <string name="bus_spi">SPI</string>
+    <string name="bus_other">总线 %1$s</string>
+    <string name="immersive_inputs_remembered">已保存：%1$s。当前可用：%2$s。</string>
+    <string name="immersive_inputs_all_filtered">你保存的设备全部由 Gold 占用。在情况改变前沉浸模式不会启动；你的选择保持不变。</string>
+    <string name="immersive_inputs_none">没有发现任何输入设备。</string>
+    <string name="immersive_inputs_unavailable">无法列出输入设备：root 被拒绝或不可用。</string>
     <!-- Accessibility -->
     <string name="accessibility_switch">无障碍按键拦截</string>
     <string name="accessibility_hint">通过无障碍服务拦截功能键（Fn、F1-F12 等），并将平板键盘上报的返回/浏览器后退键转换为 ESC。如果外接键盘的 Fn 组合键或 ESC 无法正确传到桌面，请启用此项。需要在系统 设置 &gt; 无障碍 中授予无障碍权限（仅需一次）。</string>
-
     <!-- Extra keys bar -->
     <string name="extra_keys_mode_label">扩展按键栏模式</string>
     <string name="extra_keys_mode_hint">控制何时显示类似 Termux 的底部按键栏（含 ESC/TAB/CTRL/ALT/方向键/PgUp 等）。下次返回桌面视图时生效。</string>
@@ -76,7 +120,6 @@
     <string name="layout_status_default">正在使用内置默认布局</string>
     <string name="layout_status_valid">✓ 布局有效</string>
     <string name="layout_status_invalid">✗ %1$s</string>
-
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">触摸板模式（相对移动）</string>
     <string name="touchpad_hint">开启：手指滑动移动鼠标光标（相对）。关闭：触摸直接映射到屏幕（绝对）。</string>
@@ -99,7 +142,6 @@
     <string name="gesture_scale_hint">转为触摸的手势（双指开合、三指及以上）会映射到以指针为中心、边长为此值的正方形内。值越大，相同的手指移动幅度越大。</string>
     <string name="disable_multi_finger_switch">禁用双指开合与多指手势</string>
     <string name="disable_multi_finger_hint">开启：双指捏合/张开和三指及以上的手势会被吞掉，不会传到桌面；双指滚动和双指右键仍正常。关闭：双指开合、多指手势作为触摸转发到桌面。</string>
-
     <!-- Connection -->
     <string name="socket_path_label">守护进程套接字路径</string>
     <string name="second_window_label">打开第二个窗口（独立守护进程与标题）</string>
@@ -128,14 +170,12 @@
     <string name="latency_speaker_label">扬声器（桌面 → 手机）</string>
     <string name="latency_mic_label">麦克风（手机 → 桌面）</string>
     <string name="latency_hint">更低的预设可降低延迟，但在设备繁忙时可能造成杂音/丢帧。返回桌面视图时生效。</string>
-
     <!-- Resolution -->
     <string name="width_hint">宽度（例如 1920）</string>
     <string name="height_hint">高度（例如 1080）</string>
     <string name="resolution_hint">选择预设或手动输入数值。填 0 表示原生分辨率。\"Screen ×\" 会按本设备面板（横向）缩放。下次连接时生效。</string>
     <string name="auto_stretch_switch">自动拉伸显示</string>
     <string name="auto_stretch_hint">开启时，显示内容会填满屏幕（必要时拉伸）。关闭时，显示内容保持自定义分辨率的宽高比，四周留黑边（信箱模式）。输入坐标会自动映射。</string>
-
     <!-- Settings notification -->
     <string name="notification_switch">显示设置通知</string>
     <string name="notification_hint">应用打开时显示一条常驻通知，点击可直接进入设置。关闭后不再显示。下次返回应用时生效。</string>
@@ -143,11 +183,9 @@
     <string name="notification_channel_desc">Anland 快速访问</string>
     <string name="notification_title">Anland</string>
     <string name="notification_text">点击进入设置</string>
-
     <!-- Toasts -->
     <string name="toast_no_picker">没有可用的文件选择器</string>
     <string name="toast_read_failed">无法读取文件</string>
-
     <!-- Hardware key names -->
     <string name="key_volume_up">音量+</string>
     <string name="key_volume_down">音量-</string>
@@ -162,7 +200,6 @@
     <string name="key_brightness_down">亮度-</string>
     <string name="key_home">主屏</string>
     <string name="key_back">返回</string>
-
     <!-- Audio latency presets -->
     <string-array name="latency_labels">
         <item>自动（引擎默认）</item>
@@ -172,7 +209,6 @@
         <item>安全（约 10 毫秒）</item>
         <item>宽松（约 20 毫秒）</item>
     </string-array>
-
     <!-- Resolution presets -->
     <string-array name="res_preset_labels">
         <item>预设…</item>

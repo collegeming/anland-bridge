@@ -62,48 +62,19 @@ struct buf_info {
 #define INPUT_TYPE_DISPLAY_REFRESH 7
 #define INPUT_TYPE_CLIPBOARD      8
 #define INPUT_TYPE_TEXT_INPUT      9
-#define INPUT_TYPE_ACTION 10
-#define INPUT_TYPE_RESOURCE 11
+#define INPUT_TYPE_ACTION         10
+/* Consumer -> producer: hands back the fds for a requested service (e.g. camera).
+ * The InputEvent carries { service type, fdnum }; the fdnum fds follow as a
+ * separate DATA_MSG_INPUT_EXTEND_FDS message (SCM_RIGHTS). */
+#define INPUT_TYPE_RESOURCE       11
 #define INPUT_TYPE_RESOURCE_INVALID 12
 
+/* Service identifiers used by OUTPUT_TYPE_RESOURCES_REQUEST / INPUT_TYPE_RESOURCE. */
 #define SERVICE_TYPE_CAMERA 1
-
-#define INPUT_ACTION_DOWN    0
 
 #define INPUT_ACTION_DOWN    0
 #define INPUT_ACTION_UP      1
 #define INPUT_ACTION_MOVE    2
-
-#define OUTPUT_TYPE_CLIPBOARD 1
-#define OUTPUT_TYPE_RESOURCES_REQUEST 2
-/* Producer -> consumer: set a transient Android-side runtime parameter (UINT32).
- * Carried as a fixed-size OutputEvent (no trailing payload): { var, value }.
- * A non-zero value requests the Android app enable the corresponding behaviour
- * (e.g. pointer capture) while the producer asserts it; 0 withdraws the request.
- * The consumer regresses every var to 0 on its own fallback, so the producer
- * MUST resend the current value on each reconnect. */
-#define OUTPUT_TYPE_SET_CONSUMER_VAR 3
-/* Producer -> consumer: foreground-scheduling switch. The producer reports
- * the currently focused subtree after every reconnect and on each activation
- * change: {previous pid, off} before {new pid, on}, so each event is
- * self-contained. The compositor itself is the default focus -- with no
- * active client it reports its own pid like any other app. pid is as seen in
- * the producer's PID namespace. The consumer forwards it to the root helper,
- * which setns()es into that namespace and writes pid into the top-app (on)
- * or root (off) cgroup files -- an O(1) operation. */
-#define OUTPUT_TYPE_SCHEDULING 4
-
-/* scheduling.flags */
-#define SCHEDULING_FLAG_SETTREE 0x01 /* operate on pid's whole process subtree */
-#define SCHEDULING_FLAG_ON      0x02 /* 1 = move into top-app, 0 = restore */
-
-/* Var identifiers addressable via OUTPUT_TYPE_SET_CONSUMER_VAR. */
-/* 1 = force-enable Android pointer capture (Wayland zwp_locked_pointer_v1 active,
- *   i.e. a game grabbed the mouse for relative motion); 0 = release back to the
- *   user setting. Overrides the pointer_capture setting while asserted. */
-#define CONSUMER_VAR_CAPTURE_MOUSE 1
-
-
 
 struct InputEvent {
     uint32_t type;
@@ -137,10 +108,10 @@ struct InputEvent {
             uint32_t refresh_mhz; // current display refresh rate, milli-Hz
         } display;
         struct {
-            uint32_t size; //这个packet只是通知包 作为header真正数据会集中发送,这里通知随后数据的大小
+            uint32_t size; // notification header; raw clipboard bytes follow
         } clipboard;
         struct {
-            uint32_t size; //这个packet只是通知包 作为header真正数据会集中发送,这里通知随后数据的大小
+            uint32_t size; // notification header; raw UTF-8 text bytes follow
         } text_input;
         struct {
             uint32_t action;
@@ -148,7 +119,7 @@ struct InputEvent {
         } input_action;
         struct {
             uint32_t type;
-            uint32_t fdnum;//fdnum是fd的数量,后续会有fdnum个fd跟随在这个结构体后面
+            uint32_t fdnum; // number of fds following in DATA_MSG_INPUT_EXTEND_FDS
         } resource;
         struct {
             uint32_t padding[4];
@@ -160,7 +131,7 @@ struct OutputEvent{
     uint32_t type;
     union {
         struct {
-            uint32_t size; //这个packet只是通知包 作为header真正数据会集中发送,这里通知随后数据的大小
+            uint32_t size; // notification header; raw clipboard bytes follow
         } clipboard;
         struct {
             uint32_t type;
@@ -181,6 +152,33 @@ struct OutputEvent{
 
     };
 } __attribute__((packed));
+
+#define OUTPUT_TYPE_CLIPBOARD 1
+#define OUTPUT_TYPE_RESOURCES_REQUEST 2
+/* Producer -> consumer: set a transient Android-side runtime parameter (UINT32).
+ * Fixed-size OutputEvent { var, value }, no trailing payload. A non-zero value
+ * requests the Android app enable the corresponding behaviour while asserted; 0
+ * withdraws the request. The consumer regresses every var to 0 on its own
+ * fallback, so the producer MUST resend the current value on each reconnect. */
+#define OUTPUT_TYPE_SET_CONSUMER_VAR 3
+/* Producer -> consumer: foreground-scheduling switch. The producer reports
+ * the currently focused subtree after every reconnect and on each activation
+ * change: {previous pid, off} before {new pid, on}, so each event is
+ * self-contained. The compositor itself is the default focus -- with no
+ * active client it reports its own pid like any other app. pid is as seen in
+ * the producer's PID namespace. The consumer forwards it to the root helper,
+ * which setns()es into that namespace and writes pid into the top-app (on)
+ * or root (off) cgroup files -- an O(1) operation. */
+#define OUTPUT_TYPE_SCHEDULING 4
+
+/* scheduling.flags */
+#define SCHEDULING_FLAG_SETTREE 0x01 /* operate on pid's whole process subtree */
+#define SCHEDULING_FLAG_ON      0x02 /* 1 = move into top-app, 0 = restore */
+
+/* Var identifiers addressable via OUTPUT_TYPE_SET_CONSUMER_VAR. */
+/* 1 = force-enable Android pointer capture (Wayland zwp_locked_pointer_v1 active,
+ *   a game grabbed the mouse for relative motion); 0 = release. */
+#define CONSUMER_VAR_CAPTURE_MOUSE 1
 
 /*
  * Audio runs on its own dedicated bidirectional socketpair (hello fd slot 4),
@@ -203,6 +201,8 @@ struct OutputEvent{
  */
 #define AUDIO_MSG_FORMAT 1
 #define AUDIO_MSG_PCM    2
+#define AUDIO_MSG_SHM 3 // request shared-memory ring-buffer audio transport instead of socket sends (fewer copies, lower latency)
+#define AUDIO_MSG_SHM_FD 4 // producer -> consumer: shared-memory fd, consumer mmaps it and reads audio data directly
 
 /* PCM sample format codes for struct audio_format.format. */
 #define AUDIO_FORMAT_S16LE 0

@@ -359,6 +359,16 @@ public final class SystemIME {
         return insets != null && insets.isVisible(WindowInsets.Type.ime());
     }
 
+    // True while the soft keyboard is wanted: the hidden editor stays enabled
+    // from the show request until releaseHiddenInput() runs (toggle-off, or the
+    // host's insets listener when the IME hides by any means). Insets lag or
+    // never fire in freeform mode, so the editor's enabled state is the closer
+    // "IME wanted" latch — it must not go stale-open in the other direction,
+    // and releaseHiddenInput keeps it shut on every hide path that reports.
+    boolean isImeWanted() {
+        return hiddenInput.isEnabled();
+    }
+
     void releaseHiddenInput() {
         if (!hiddenInput.isEnabled()) return;  // already released
         hiddenInput.clearFocus();

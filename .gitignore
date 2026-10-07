@@ -1,11 +1,13 @@
 # ---- Build outputs ----
 build/
+build-*/
 cmake-build-*/
 *.o
 *.a
 *.so
 *.out
 anland-daemon.zip
+*.log
 
 # CMake
 CMakeCache.txt
@@ -30,6 +32,9 @@ local.properties
 obj/
 .externalNativeBuild/
 
+# ---- KWin-verification private-header stubs (downloaded for syntax checks) ----
+.kwin-stubs/
+
 # ---- IDE ----
 .idea/
 *.iml
@@ -40,3 +45,10 @@ obj/
 # ---- OS ----
 .DS_Store
 Thumbs.db
+# Local packaging and verification output
+artifacts/
+.cache/
+*.pkg.tar.*
+*.deb
+__pycache__/
+*.py[cod]

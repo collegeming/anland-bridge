@@ -1,14 +1,15 @@
 package com.anland.consumer;
 
 import android.content.Context;
-import android.util.SparseIntArray;
+import java.util.HashMap;
+import java.util.Map;
 import android.view.KeyEvent;
 
 public class KeyCodeMapper {
-    private static final SparseIntArray MAP = new SparseIntArray();
+    private static final Map<Integer, Integer> MAP = new HashMap<>();
 
     /** Android keycode → localized name, for the keys worth binding to. */
-    private static final SparseIntArray NAME_RES = new SparseIntArray();
+    private static final Map<Integer, Integer> NAME_RES = new HashMap<>();
     static {
         NAME_RES.put(KeyEvent.KEYCODE_VOLUME_UP, R.string.key_volume_up);
         NAME_RES.put(KeyEvent.KEYCODE_VOLUME_DOWN, R.string.key_volume_down);
@@ -31,7 +32,7 @@ public class KeyCodeMapper {
      * all (some vendor keys only report a scan code).
      */
     public static String keyName(Context ctx, int keyCode, int scanCode) {
-        int nameRes = NAME_RES.get(keyCode);
+        int nameRes = NAME_RES.getOrDefault(keyCode, 0);
         if (nameRes != 0)
             return ctx.getString(nameRes);
         if (keyCode != -1 && keyCode != KeyEvent.KEYCODE_UNKNOWN)
@@ -152,6 +153,6 @@ public class KeyCodeMapper {
     }
 
     public static int getScanCode(int keyCode) {
-        return MAP.get(keyCode, -1);
+        return MAP.getOrDefault(keyCode, -1);
     }
 }

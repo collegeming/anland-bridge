@@ -8,7 +8,7 @@
 #
 # The Mutter patch enables the Anland backend, and the sibling 'mutter/'
 # directory contains the backend files copied into the source tree. The Mutter
-# source version is pinned below because the patch targets that Ubuntu package
+# source version is pinned below because the patch targets that Debian package
 # revision. XWayland follows the latest source version available to apt.
 #
 # You can override the patch locations with MUTTER_PATCH=... and
@@ -95,20 +95,16 @@ build_pkg() {
     if [ -n "$overlay_dir" ]; then
         [ -d "$overlay_dir" ] || die "overlay directory not found: $overlay_dir"
         log "Overlaying '$overlay_dir' -> $tree (overwrite-merge)"
-        cp -a "$overlay_dir/." "$tree/"
+        # Follow overlay symlinks so the staged source contains real backend
+        # files: the overlay reaches the shared device layer and protocol header
+        # through nested relative links, which would dangle once copied.
+        cp -aL "$overlay_dir/." "$tree/" \
+            || die "failed to stage the backend overlay for $src"
     fi
 
     log "Applying patch: $patch -> $tree"
-    if ( cd "$tree" && patch --batch -p1 --forward --reject-file=- < "$patch" ); then
-        :
-    else
-        # already applied? Verify using the caller's patch sentinel.
-        if [ -n "$sentinel" ] && grep -rqF -- "$sentinel" "$tree" 2>/dev/null; then
-            warn "patch looks already applied, continuing"
-        else
-            die "patch did not apply cleanly for $src"
-        fi
-    fi
+    ( cd "$tree" && patch --batch -p1 --forward --reject-file=- < "$patch" ) \
+        || die "patch did not apply cleanly for $src"
 
     log "Building '$src' $source_label (.deb)"
     # -d: don't re-check build-deps (already installed above)
@@ -117,6 +113,10 @@ build_pkg() {
         dpkg-buildpackage -b -uc -us -d ) \
         || die "dpkg-buildpackage failed for $src"
 
+    if [ "${ANLAND_INSTALL:-0}" != 1 ]; then
+        log "Build only: not installing $src"
+        return 0
+    fi
     log "Installing built .deb(s) for '$src'"
     local debs
     debs="$(find "$WORKDIR/$src" -maxdepth 1 -name '*.deb' -type f)"
@@ -124,7 +124,7 @@ build_pkg() {
     printf '%s\n' "$debs"
     # shellcheck disable=SC2086
     $SUDO dpkg --force-confdef --force-confold -i $debs \
-        || warn "dpkg -i for $src reported issues (deps?)"
+        || die "dpkg -i for $src failed"
 }
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,12 @@ main() {
     build_pkg xwayland "$xwayland_patch" '' '' \
         'No usable linux-dmabuf main device'
 
-    sed -i '/PULSE_SERVER=unix:\/tmp\/.pulse-socket/d' /etc/environment
+    if [ "${ANLAND_INSTALL:-0}" != 1 ]; then
+        log "Done. Built packages only; global environment unchanged."
+        return 0
+    fi
+    $SUDO sed -i '/PULSE_SERVER=unix:\/tmp\/.pulse-socket/d' /etc/environment \
+        || die "failed to update /etc/environment"
 
     log "Done. Patched Mutter and XWayland built and installed."
     echo "Built packages are under: $WORKDIR/{mutter,xwayland}/"

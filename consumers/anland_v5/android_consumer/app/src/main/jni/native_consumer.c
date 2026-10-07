@@ -1394,6 +1394,45 @@ static bool append_shell_single_quoted(char *dst, size_t capacity,
 }
 
 /*
+ * Appends `in` to `out` as one shell word, separated from whatever is already
+ * there: single-quoted, with embedded quotes escaped as '\''. This is what makes
+ * the result safe to hand to `su -c` -- without it, a socket path containing a
+ * shell metacharacter is a command run as root, and the socket path comes from
+ * the saved preference or from the launch Intent, neither of which is ours.
+ *
+ * Returns false when the result would not fit. The caller must then refuse
+ * rather than run it: a truncated command line is a different command.
+ */
+static bool append_quoted(char *out, size_t out_size, size_t *used, const char *in)
+{
+    if (*used > 0) {
+        if (*used + 1 >= out_size)
+            return false;
+        out[(*used)++] = ' ';
+    }
+    if (*used + 1 >= out_size)
+        return false;
+    out[(*used)++] = '\'';
+    for (const char *p = in; *p != '\0'; p++) {
+        if (*p == '\'') {
+            if (*used + 4 >= out_size)
+                return false;
+            memcpy(out + *used, "'\\''", 4);
+            *used += 4;
+        } else {
+            if (*used + 1 >= out_size)
+                return false;
+            out[(*used)++] = *p;
+        }
+    }
+    if (*used + 2 >= out_size)
+        return false;
+    out[(*used)++] = '\'';
+    out[*used] = '\0';
+    return true;
+}
+
+/*
  * "Connect with root" handshake. The app cannot connect() to a root-owned
  * daemon socket directly, so it listens on a bridge socket, launches the bundled
  * helper through `su -c`, and the helper (as root) connects to the daemon and

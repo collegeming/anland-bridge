@@ -1,6 +1,7 @@
 package com.anland.consumer;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
@@ -11,6 +12,7 @@ import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.CountDownTimer;
 import android.text.Editable;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.text.InputType;
 import android.util.Log;
@@ -18,11 +20,13 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -35,6 +39,13 @@ import android.widget.Toast;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.Locale;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 
 
 public class SettingsActivity extends Activity {
@@ -52,6 +63,8 @@ public class SettingsActivity extends Activity {
     private static final String KEY_IMMERSIVE_ENABLED = ImmersiveMode.KEY_ENABLED;
     private static final String KEY_IMMERSIVE_KEYCODE = ImmersiveMode.KEY_KEYCODE;
     private static final String KEY_IMMERSIVE_SCANCODE = ImmersiveMode.KEY_SCANCODE;
+    private static final String KEY_OPLUS_REFRESH_RATE_LOCK =
+            OplusRefreshRateLease.KEY_ENABLED;
     private static final String KEY_EXTRA_KEYS_MODE = "extra_keys_mode";
     // Mapped to R.array.extra_keys_mode_options positions
     private static final String MODE_ALWAYS = "always";
@@ -87,9 +100,39 @@ public class SettingsActivity extends Activity {
     // in the R.array.latency_labels string-array, parallel to this array.
     private static final int[] LATENCY_MS = {0, 1, 3, 5, 10, 20};
 
-    // Which secondary page is on screen. Back returns HOME -> exits the activity.
-    private enum Page { HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION, GENERAL }
+    // Which secondary page is on screen. Back walks up to the parent page;
+    // Back from HOME exits the activity.
+    private enum Page {
+        HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION, GENERAL,
+        IMMERSIVE, IMMERSIVE_INPUTS
+    }
     private Page currentPage = Page.HOME;
+
+    /**
+     * Where Back goes from each page. Immersive inputs is reached from the
+     * Immersive page, so it returns there rather than all the way home.
+     */
+    private static Page parentOf(Page page) {
+        if (page == Page.IMMERSIVE_INPUTS)
+            return Page.IMMERSIVE;
+        return Page.HOME;
+    }
+
+    /**
+     * Bumped whenever the immersive-inputs page is rebuilt. The discovery and
+     * status lookups are asynchronous, and an answer that arrives after the user
+     * has left the page must not touch the view hierarchy it was built for.
+     */
+    private int immersivePageToken;
+
+    /**
+     * The last discovery and occupancy answers, kept so the rows can be redrawn
+     * the moment a setting changes. Without them, flipping "choose automatically"
+     * would save the preference and leave the checkboxes exactly as they were —
+     * disabled — until the user left the page and came back.
+     */
+    private List<InputGrab.DiscoveredDevice> immersiveDevices;
+    private GoldInputStatusClient.Result immersiveGold;
 
     // The key-binding row currently counting down, if any: it gets the next key
     // press. The rows themselves live in the page's view hierarchy.
@@ -158,6 +201,8 @@ public class SettingsActivity extends Activity {
             R.string.cat_connection_subtitle, this::showConnectionPage);
         addCategoryRow(root, R.string.section_resolution,
             R.string.cat_resolution_subtitle, this::showResolutionPage);
+        addCategoryRow(root, R.string.cat_immersive_title,
+            R.string.cat_immersive_subtitle, this::showImmersivePage);
         addCategoryRow(root, R.string.cat_general_title,
             R.string.cat_general_subtitle, this::showGeneralPage);
 
@@ -236,7 +281,7 @@ public class SettingsActivity extends Activity {
         back.setTextColor(0xFF1565C0);
         back.setPadding(0, 0, 0, dp(12));
         back.setClickable(true);
-        back.setOnClickListener(v -> showHome());
+        back.setOnClickListener(v -> showPage(parentOf(currentPage)));
         root.addView(back);
 
         TextView title = new TextView(this);
@@ -250,11 +295,25 @@ public class SettingsActivity extends Activity {
         return root;
     }
 
+    /** Dispatches to a page by enum, for nested Back navigation. */
+    private void showPage(Page page) {
+        switch (page) {
+            case KEYBOARD: showKeyboardPage(); break;
+            case TOUCHPAD: showTouchpadPage(); break;
+            case CONNECTION: showConnectionPage(); break;
+            case RESOLUTION: showResolutionPage(); break;
+            case GENERAL: showGeneralPage(); break;
+            case IMMERSIVE: showImmersivePage(); break;
+            case IMMERSIVE_INPUTS: showImmersiveInputsPage(); break;
+            case HOME:
+            default: showHome(); break;
+        }
+    }
+
     private void showKeyboardPage() {
         currentPage = Page.KEYBOARD;
         LinearLayout root = newPage(R.string.cat_keyboard_title);
         buildVirtualKeyboardSection(root);
-        buildImmersiveSection(root);
         buildAccessibilitySection(root);
         buildExtraKeysSection(root);
         buildCustomLayoutSection(root);
@@ -291,13 +350,400 @@ public class SettingsActivity extends Activity {
         setContent(root);
     }
 
+    // ============================================================
+    // Immersive page and its input-source page
+    // ============================================================
+
+    private void showImmersivePage() {
+        currentPage = Page.IMMERSIVE;
+        LinearLayout root = newPage(R.string.cat_immersive_title);
+        buildImmersiveSection(root);
+        addCategoryRow(root, R.string.immersive_inputs_title,
+            R.string.immersive_inputs_subtitle, this::showImmersiveInputsPage);
+        setContent(root);
+    }
+
+    private void showImmersiveInputsPage() {
+        currentPage = Page.IMMERSIVE_INPUTS;
+        // Any lookup still in flight belongs to the page being replaced, and the
+        // answers it was going to fill in belong to it too.
+        final int token = ++immersivePageToken;
+        immersiveDevices = null;
+        immersiveGold = null;
+
+        LinearLayout root = newPage(R.string.immersive_inputs_title);
+        addSectionHeader(root, R.string.section_immersive_inputs_source, dp(8));
+
+        ImmersiveInputSource source = ImmersiveInputSource.read(
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE));
+
+        // Three ways to get input, in the order the string-array lists them.
+        final ImmersiveInputSource[] sources = ImmersiveInputSource.ORDER;
+        int selectedIndex = source.menuIndex();
+
+        Spinner sourcePicker = new Spinner(this);
+        // Which sources need the Gold module, resolved once: it is a device
+        // lookup, not a preference read.
+        final boolean goldAvailable = GoldKeyboard.goldKeyboardPresent(this);
+        final boolean[] sourceUsable = new boolean[sources.length];
+        for (int index = 0; index < sources.length; index++)
+            sourceUsable[index] = sources[index].isAvailable(this);
+        // The unavailable ones stay on the list, greyed and unselectable. An
+        // option that vanished would leave the user wondering where it went;
+        // an option that can be picked but does nothing is worse than both.
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
+            android.R.layout.simple_spinner_item,
+            getResources().getStringArray(R.array.immersive_source_options)) {
+            @Override
+            public boolean isEnabled(int position) {
+                return position >= 0 && position < sourceUsable.length && sourceUsable[position];
+            }
+
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                return greyWhenUnusable(super.getView(position, convertView, parent), position);
+            }
+
+            @Override
+            public View getDropDownView(int position, View convertView, ViewGroup parent) {
+                return greyWhenUnusable(
+                        super.getDropDownView(position, convertView, parent), position);
+            }
+
+            private View greyWhenUnusable(View row, int position) {
+                if (row instanceof TextView)
+                    ((TextView) row).setTextColor(isEnabled(position) ? Color.BLACK : Color.GRAY);
+                row.setEnabled(isEnabled(position));
+                return row;
+            }
+        };
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        sourcePicker.setAdapter(adapter);
+        // Set before the listener, so restoring the stored value does not look
+        // like the user changing it.
+        sourcePicker.setSelection(selectedIndex);
+        root.addView(sourcePicker);
+
+        TextView sourceHint = new TextView(this);
+        sourceHint.setText(sourceHintFor(source));
+        sourceHint.setTextSize(13);
+        sourceHint.setTextColor(Color.GRAY);
+        sourceHint.setPadding(0, 0, 0, dp(8));
+        root.addView(sourceHint);
+
+        sourcePicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (position < 0 || position >= sources.length)
+                    return;
+                ImmersiveInputSource picked = sources[position];
+                // A Spinner applies its selection during layout, not when
+                // setSelection is called, so this fires once for the value the
+                // page was built with as well. Acting on that would rebuild the
+                // page, build another Spinner, and fire again -- a loop that
+                // also spawns a process each time round. Nothing to do unless
+                // the user actually picked something else.
+                if (picked == ImmersiveInputSource.read(
+                        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)))
+                    return;
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(ImmersiveInputSource.KEY_PREFERENCE, picked.preferenceValue)
+                    .apply();
+                // Rebuild so the page describes the source now selected, and
+                // nothing else.
+                showImmersiveInputsPage();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+
+        setContent(root);
+        // Gold output is discovered by identity; only physical nodes need a picker.
+        if (source == ImmersiveInputSource.EXISTING_UINPUT_BUS) {
+            Switch autoEnter = new Switch(this);
+            autoEnter.setText(R.string.immersive_auto_enter);
+            autoEnter.setTextSize(14);
+            autoEnter.setChecked(getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(ImmersiveInputController.KEY_AUTO_ENTER, false));
+            autoEnter.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putBoolean(ImmersiveInputController.KEY_AUTO_ENTER, checked).apply());
+            root.addView(autoEnter);
+
+            TextView autoHint = new TextView(this);
+            autoHint.setText(R.string.immersive_auto_enter_hint);
+            autoHint.setTextSize(13);
+            autoHint.setTextColor(Color.GRAY);
+            autoHint.setPadding(0, 0, 0, dp(8));
+            root.addView(autoHint);
+
+            addSectionHeader(root, R.string.section_immersive_inputs_scope, dp(16));
+            TextView scope = new TextView(this);
+            scope.setText(R.string.immersive_inputs_bus_scope);
+            scope.setTextSize(13);
+            scope.setTextColor(Color.GRAY);
+            root.addView(scope);
+        } else {
+            buildDirectNodeSection(root, token);
+        }
+    }
+
+    /** The line under the source picker, describing the source it names. */
+    private int sourceHintFor(ImmersiveInputSource source) {
+        switch (source) {
+            case EXISTING_UINPUT_BUS:
+                return R.string.immersive_inputs_bus_hint;
+            case DIRECT_PLUS_GOLD_KEYBOARD:
+                return R.string.immersive_inputs_combined_hint;
+            case DIRECT_EVENT_NODES:
+            default:
+                return R.string.immersive_inputs_direct_blurb;
+        }
+    }
+
+    private void buildDirectNodeSection(LinearLayout root, final int token) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        addSectionHeader(root, R.string.section_immersive_inputs_direct, dp(16));
+
+        Switch autoSwitch = new Switch(this);
+        autoSwitch.setText(R.string.immersive_inputs_auto);
+        autoSwitch.setTextSize(14);
+        autoSwitch.setChecked(ImmersiveInputSource.isAutomatic(prefs));
+        root.addView(autoSwitch);
+
+        final TextView status = new TextView(this);
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+
+        autoSwitch.setOnCheckedChangeListener((v, checked) -> {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(ImmersiveInputSource.KEY_AUTO, checked).apply();
+            // The rows below are what the setting acts on, so they have to follow
+            // it now — not on the next visit to the page.
+            renderImmersiveInputRows(status, list);
+        });
+
+        TextView directHint = new TextView(this);
+        directHint.setText(R.string.immersive_inputs_direct_hint);
+        directHint.setTextSize(13);
+        directHint.setTextColor(Color.GRAY);
+        root.addView(directHint);
+
+        status.setText(R.string.immersive_inputs_loading);
+        status.setTextSize(13);
+        status.setPadding(0, dp(12), 0, dp(6));
+        root.addView(status);
+        root.addView(list);
+
+        loadImmersiveInputs(token, status, list);
+    }
+
+    /** Redraws the rows from the answers already in hand, without asking again. */
+    private void renderImmersiveInputRows(TextView status, LinearLayout list) {
+        if (immersiveDevices == null)
+            return;
+        showImmersiveInputRows(status, list, immersiveDevices, immersiveGold);
+    }
+
+    /** The device type, in the same terms Gold's own list uses. */
+    private String deviceTypeLabel(InputGrab.DiscoveredDevice device) {
+        switch (device.cls) {
+            case InputGrab.CLASS_TOUCHSCREEN:
+                return getString(R.string.device_class_touchscreen);
+            case InputGrab.CLASS_TOUCHPAD:
+                return getString(R.string.device_class_touchpad);
+            case InputGrab.CLASS_MOUSE:
+                return getString(R.string.device_class_mouse);
+            case InputGrab.CLASS_KEYBOARD:
+            default:
+                // A node that merely carries a few keys — gpio-keys, a powerkey —
+                // is not the keyboard anyone types on, and labelling it as one
+                // makes the list harder to read than no label at all.
+                return getString(device.alphaKeys
+                    ? R.string.device_class_keyboard
+                    : R.string.device_class_keys);
+        }
+    }
+
+    /** How the device is attached — the same distinction Gold's list draws. */
+    private String deviceBusLabel(InputGrab.DiscoveredDevice device) {
+        switch (device.bus) {
+            case InputGrab.BUS_USB:
+                return getString(R.string.bus_usb);
+            case InputGrab.BUS_BLUETOOTH:
+                return getString(R.string.bus_bluetooth);
+            case InputGrab.BUS_VIRTUAL:
+                return getString(R.string.bus_virtual);
+            case 0:  // panel and platform devices report no bus at all
+            case InputGrab.BUS_I8042:
+            case InputGrab.BUS_HOST:
+                return getString(R.string.bus_builtin);
+            case InputGrab.BUS_I2C:
+                return getString(R.string.bus_i2c);
+            case InputGrab.BUS_SPI:
+                return getString(R.string.bus_spi);
+            default:
+                return getString(R.string.bus_other,
+                    String.format(Locale.ROOT, "%04x", device.bus));
+        }
+    }
+
+    /**
+     * Looks up the nodes and Gold's occupancy off the main thread, then fills the
+     * page in. Both answers are needed before anything can be shown: the nodes to
+     * list, and what Gold holds so those rows can be shown as taken.
+     */
+    private void loadImmersiveInputs(final int token, final TextView status,
+                                     final LinearLayout list) {
+        final Context appContext = getApplicationContext();
+        Thread worker = new Thread(() -> {
+            final List<InputGrab.DiscoveredDevice> devices =
+                InputGrab.discoverDevices(appContext);
+            final GoldInputStatusClient.Result gold = new GoldInputStatusClient(
+                new GoldController(new SuCommand.SuRunner(), GoldController.DEFAULT_CONTROLLER,
+                    new SecureRandom())).query();
+            runOnUiThread(() -> {
+                // The page may have been rebuilt or left while this was in
+                // flight; its views are gone and must not be touched.
+                if (token != immersivePageToken)
+                    return;
+                showImmersiveInputRows(status, list, devices, gold);
+            });
+        }, "anland-immersive-discovery");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void showImmersiveInputRows(TextView status, LinearLayout list,
+                                        List<InputGrab.DiscoveredDevice> devices,
+                                        GoldInputStatusClient.Result gold) {
+        immersiveDevices = devices;
+        immersiveGold = gold;
+        list.removeAllViews();
+
+        if (devices == null) {
+            status.setText(R.string.immersive_inputs_unavailable);
+            return;
+        }
+
+        // Only a verified snapshot may mark anything as Gold's. An unreadable
+        // Gold marks nothing and says so, rather than looking like an idle Gold.
+        //
+        // The whole claimed set, not just the held node: a keyboard offered over
+        // two transports is Gold's whichever one it happens to be holding.
+        Set<String> occupied = new LinkedHashSet<>();
+        if (gold.state == GoldInputStatusClient.State.VERIFIED)
+            occupied.addAll(gold.snapshot.claimed);
+
+        if (gold.state == GoldInputStatusClient.State.UNKNOWN)
+            status.setText(R.string.immersive_inputs_unknown);
+        else if (devices.isEmpty())
+            status.setText(R.string.immersive_inputs_none);
+        else
+            status.setText(R.string.immersive_inputs_found);
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean automatic = ImmersiveInputSource.isAutomatic(prefs);
+        Set<String> saved = ImmersiveInputSource.savedNodes(prefs);
+        final Set<String> selected = new TreeSet<>(saved);
+
+        // Power, volume and the other button nodes are not offered at all: they
+        // belong to Android's own wake and volume paths, and a row nobody should
+        // ever tick is worse than no row.
+        List<InputGrab.DiscoveredDevice> visible = new ArrayList<>();
+        for (InputGrab.DiscoveredDevice device : devices) {
+            if (InputGrab.isVisible(device))
+                visible.add(device);
+        }
+        if (visible.isEmpty()) {
+            status.setText(R.string.immersive_inputs_none);
+            return;
+        }
+
+        for (InputGrab.DiscoveredDevice device : visible) {
+            boolean held = occupied.contains(device.node);
+            CheckBox row = new CheckBox(this);
+            String label = device.node + "  ·  " + device.name
+                + "  ·  " + deviceTypeLabel(device)
+                + "  ·  " + deviceBusLabel(device);
+            if (!InputGrab.isSelectable(device)) {
+                row.setText(getString(R.string.immersive_inputs_system_power, label));
+                row.setChecked(false);
+                row.setEnabled(false);
+            } else if (held) {
+                // Gold's. Deliberately not ticked: a tick reads as "you selected
+                // this", which is the opposite of what the row means. It is
+                // marked as unavailable instead.
+                row.setText(getString(R.string.immersive_inputs_occupied, label));
+                row.setChecked(false);
+                row.setEnabled(false);
+            } else if (automatic) {
+                // Show what automatic selection is about to take. Leaving these
+                // blank next to a switch that says "choose automatically" tells
+                // the user nothing about what is going to be taken from Android.
+                row.setText(label);
+                row.setChecked(true);
+                row.setEnabled(false);
+            } else {
+                row.setText(label);
+                row.setChecked(selected.contains(device.node));
+                row.setEnabled(true);
+                row.setOnCheckedChangeListener((v, isChecked) -> {
+                    if (isChecked)
+                        selected.add(device.node);
+                    else
+                        selected.remove(device.node);
+                    saveSelectedNodes(selected);
+                });
+            }
+            list.addView(row);
+        }
+
+        // Saved intent that the current occupancy cannot honour is still the
+        // user's intent. Show the difference; never rewrite what they saved.
+        Set<String> effective = new TreeSet<>(saved);
+        effective.removeAll(occupied);
+        if (!saved.isEmpty() && effective.isEmpty()) {
+            addNote(list, getString(R.string.immersive_inputs_all_filtered));
+        } else if (effective.size() != saved.size()) {
+            addNote(list, getString(R.string.immersive_inputs_remembered,
+                TextUtils.join(", ", new TreeSet<>(saved)),
+                TextUtils.join(", ", effective)));
+        }
+    }
+
+    private void addNote(LinearLayout parent, String text) {
+        TextView note = new TextView(this);
+        note.setText(text);
+        note.setTextSize(13);
+        note.setTextColor(0xFFC62828);
+        note.setPadding(0, dp(12), 0, 0);
+        parent.addView(note);
+    }
+
+    /** Persists the selection sorted, so the stored value never depends on row order. */
+    private void saveSelectedNodes(Set<String> nodes) {
+        StringBuilder value = new StringBuilder();
+        for (String node : new TreeSet<>(nodes)) {
+            if (value.length() > 0)
+                value.append(',');
+            value.append(node);
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(ImmersiveInputSource.KEY_NODES, value.toString())
+            .apply();
+    }
+
     @Override
     public void onBackPressed() {
         // While listening for a key binding, let onKeyDown capture the Back key
         // instead of navigating back.
         if (listeningBinding != null) return;
         if (currentPage != Page.HOME) {
-            showHome();
+            showPage(parentOf(currentPage));
         } else {
             super.onBackPressed();
         }
@@ -360,6 +806,23 @@ public class SettingsActivity extends Activity {
         immersiveHint.setTextColor(Color.GRAY);
         immersiveHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(immersiveHint);
+
+        Switch refreshRateSwitch = new Switch(this);
+        refreshRateSwitch.setText(R.string.immersive_oplus_refresh_rate_switch);
+        refreshRateSwitch.setTextSize(14);
+        refreshRateSwitch.setChecked(prefs.getBoolean(KEY_OPLUS_REFRESH_RATE_LOCK,
+                OplusRefreshRateLease.DEFAULT_ENABLED));
+        refreshRateSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_OPLUS_REFRESH_RATE_LOCK, checked).apply());
+        root.addView(refreshRateSwitch);
+
+        TextView refreshRateHint = new TextView(this);
+        refreshRateHint.setText(R.string.immersive_oplus_refresh_rate_hint);
+        refreshRateHint.setTextSize(12);
+        refreshRateHint.setTextColor(Color.GRAY);
+        refreshRateHint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(refreshRateHint);
 
         // Constructing the row appends it to `root`.
         new KeyBinding(root, KEY_IMMERSIVE_KEYCODE, KEY_IMMERSIVE_SCANCODE,

@@ -72,6 +72,10 @@ jobs:
           keytool -list -keystore "$HOME/.android/anland-ci.keystore" \
             -storepass android -alias anlandci >/dev/null 2>&1
 
+      - name: Test native input handling
+        working-directory: consumers/anland_v5/android_consumer
+        run: sh app/src/test/native/run_input_grab_tests.sh
+
       - name: Clean, test, and build plain release APK
         working-directory: consumers/anland_v5/android_consumer
         run: |

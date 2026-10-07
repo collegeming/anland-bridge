@@ -8,15 +8,16 @@
 #
 # The Mutter patch enables the Anland backend, and the sibling 'mutter/'
 # directory contains the backend files copied into the source tree. The Mutter
-# source version is pinned below because the patch targets that Ubuntu package
-# revision. XWayland follows the latest source version available to apt.
+# source version follows the latest version available to apt by default. Set
+# MUTTER_VERSION to pin a revision when needed. XWayland follows the latest
+# source version available to apt.
 #
 # You can override the patch locations with MUTTER_PATCH=... and
 # XWAYLAND_PATCH=... ./build.sh.
 #
 set -u
 
-MUTTER_VERSION='50.1-0ubuntu2.2'
+MUTTER_VERSION="${MUTTER_VERSION:-}"
 
 # ---- sudo helper (no-op if already root) -----------------------------------
 if [ "$(id -u)" -eq 0 ]; then
@@ -27,7 +28,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR="${WORKDIR:-$HOME/anland-debbuild}"
-JOBS="$(nproc)"
+JOBS="${JOBS:-$(nproc)}"
 
 # ---- locate a patch file by name, regardless of where it lives -------------
 find_patch() {
@@ -50,6 +51,39 @@ find_patch() {
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m[error] %s\033[0m\n' "$*" >&2; exit 1; }
+
+# When MUTTER_VERSION is pinned, Ubuntu may remove that version from the current
+# Sources index while its files remain available in the archive pool. Fetch the
+# exact pinned revision instead of silently switching to a newer revision whose
+# patch may no longer apply.
+fetch_archived_source() {
+    local src="$1" version="$2" dest="$3"
+    local base="${MUTTER_SOURCE_POOL:-http://ports.ubuntu.com/ubuntu-ports/pool/main/m/mutter}"
+    local dsc="${src}_${version}.dsc"
+    local dsc_path="$dest/$dsc"
+    local file
+
+    log "Fetching archived source: $src $version"
+    curl --fail --location --retry 2 --connect-timeout 15 --max-time 300 \
+        -o "$dsc_path" "$base/$dsc" \
+        || return 1
+
+    # The .dsc is authoritative for the exact orig/debian archive names.
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        curl --fail --location --retry 2 --connect-timeout 15 --max-time 300 \
+            -o "$dest/$file" "$base/$file" \
+            || return 1
+    done <<EOF
+$(awk '
+    /^Files:/ { in_files=1; next }
+    in_files && /^Checksums-/ { exit }
+    in_files && /^[[:space:]]*[0-9A-Fa-f]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+$/ { print $3 }
+' "$dsc_path")
+EOF
+
+    ( cd "$dest" && dpkg-source -x "$dsc" )
+}
 
 # ---- ensure deb-src entries exist so `apt source` works --------------------
 ensure_deb_src() {
@@ -85,8 +119,15 @@ build_pkg() {
     log "Fetching source for '$src' ($source_label)"
     rm -rf "${WORKDIR:?}/$src"
     mkdir -p "$WORKDIR/$src"
-    ( cd "$WORKDIR/$src" && apt-get source "$source_spec" ) \
-        || die "apt-get source $src failed"
+    if ! ( cd "$WORKDIR/$src" && apt-get source "$source_spec" ); then
+        if [ "$src" = mutter ] && [ -n "$version" ]; then
+            warn "APT has no exact $source_spec; using the pinned Ubuntu archive source"
+            fetch_archived_source "$src" "$version" "$WORKDIR/$src" \
+                || die "could not fetch archived source $source_spec"
+        else
+            die "apt-get source $src failed"
+        fi
+    fi
 
     local tree
     tree="$(find "$WORKDIR/$src" -maxdepth 1 -type d -name "${src}-*" | head -1)"
@@ -95,19 +136,19 @@ build_pkg() {
     if [ -n "$overlay_dir" ]; then
         [ -d "$overlay_dir" ] || die "overlay directory not found: $overlay_dir"
         log "Overlaying '$overlay_dir' -> $tree (overwrite-merge)"
-        cp -a "$overlay_dir/." "$tree/"
+        # Follow overlay symlinks so the staged source contains real backend files.
+        # -L is required: the backend tree is reached through overlay links, and a
+        # plain -a would stage dangling links instead of the shared sources.
+        cp -aL "$overlay_dir/." "$tree/" \
+            || die "failed to stage the backend overlay for $src"
     fi
 
     log "Applying patch: $patch -> $tree"
-    if ( cd "$tree" && patch --batch -p1 --forward --reject-file=- < "$patch" ); then
-        :
-    else
-        # already applied? Verify using the caller's patch sentinel.
-        if [ -n "$sentinel" ] && grep -rqF -- "$sentinel" "$tree" 2>/dev/null; then
-            warn "patch looks already applied, continuing"
-        else
-            die "patch did not apply cleanly for $src"
-        fi
+    # The source was just unpacked, so the patch must apply completely. Accepting
+    # a partial application (a sentinel string elsewhere in the tree) would build
+    # a tree where later hunks never landed, which is far worse than failing here.
+    if ! ( cd "$tree" && patch --batch -p1 --forward --reject-file=- < "$patch" ); then
+        die "patch did not apply cleanly for $src"
     fi
 
     log "Building '$src' $source_label (.deb)"
@@ -117,14 +158,28 @@ build_pkg() {
         dpkg-buildpackage -b -uc -us -d ) \
         || die "dpkg-buildpackage failed for $src"
 
+    if [ "${ANLAND_INSTALL:-0}" != 1 ]; then
+        log "Build only: not installing $src"
+        return 0
+    fi
     log "Installing built .deb(s) for '$src'"
-    local debs
-    debs="$(find "$WORKDIR/$src" -maxdepth 1 -name '*.deb' -type f)"
-    [ -n "$debs" ] || die "no .deb produced for $src"
-    printf '%s\n' "$debs"
-    # shellcheck disable=SC2086
-    $SUDO dpkg --force-confdef --force-confold -i $debs \
-        || warn "dpkg -i for $src reported issues (deps?)"
+    local built_version changes debs deb
+    local files=()
+    built_version="$(dpkg-parsechangelog -l "$tree/debian/changelog" -S Version)" \
+        || die "cannot read built version for $src"
+    built_version="${built_version#*:}" # Debian filenames omit the epoch.
+    changes="$WORKDIR/$src/${src}_${built_version}_$(dpkg --print-architecture).changes"
+    [ -f "$changes" ] || die "missing .changes for $src: $changes"
+    debs="$(awk '/^Files:/ {in_files=1; next} in_files && /^[^ ]/ {exit} in_files && $5 ~ /\.deb$/ {print $5}' "$changes")"
+    [ -n "$debs" ] || die "no .deb listed in $changes"
+    while IFS= read -r deb; do
+        [[ "$deb" == *.deb && "$deb" != */* ]] || die "unsafe package name in $changes"
+        [ -f "$WORKDIR/$src/$deb" ] || die "missing package $deb"
+        files+=("$WORKDIR/$src/$deb")
+    done <<< "$debs"
+    printf '%s\n' "${files[@]}"
+    $SUDO dpkg --force-confdef --force-confold -i "${files[@]}" \
+        || die "dpkg -i for $src failed"
 }
 
 # ---------------------------------------------------------------------------
@@ -135,7 +190,11 @@ main() {
     xwayland_patch="$(find_patch xwayland.patch "${XWAYLAND_PATCH:-}")" \
         || die "xwayland.patch not found (set XWAYLAND_PATCH=... to override)"
 
-    log "mutter version : $MUTTER_VERSION"
+    if [ -n "$MUTTER_VERSION" ]; then
+        log "mutter version : $MUTTER_VERSION (pinned)"
+    else
+        log "mutter version : latest available to APT"
+    fi
     log "mutter.patch   : $mutter_patch"
     log "xwayland.patch : $xwayland_patch"
     log "xwayland source: latest available"
@@ -148,7 +207,12 @@ main() {
     build_pkg xwayland "$xwayland_patch" '' '' \
         'No usable linux-dmabuf main device'
 
-    sed -i '/PULSE_SERVER=unix:\/tmp\/.pulse-socket/d' /etc/environment
+    if [ "${ANLAND_INSTALL:-0}" != 1 ]; then
+        log "Done. Built packages only; global environment unchanged."
+        return 0
+    fi
+    $SUDO sed -i '/PULSE_SERVER=unix:\/tmp\/.pulse-socket/d' /etc/environment \
+        || die "failed to update /etc/environment"
 
     log "Done. Patched Mutter and XWayland built and installed."
     echo "Built packages are under: $WORKDIR/{mutter,xwayland}/"

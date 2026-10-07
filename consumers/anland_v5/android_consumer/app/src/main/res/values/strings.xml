@@ -15,7 +15,7 @@
     <!-- Settings home: category rows and back navigation -->
     <string name="nav_back">‹ Back</string>
     <string name="cat_keyboard_title">Keyboard &amp; Keys</string>
-    <string name="cat_keyboard_subtitle">Key binding, immersive mode, accessibility &amp; extra keys bar</string>
+    <string name="cat_keyboard_subtitle">Key binding, accessibility &amp; extra keys bar</string>
     <string name="cat_touchpad_title">Touchpad &amp; Mouse</string>
     <string name="cat_touchpad_subtitle">Touchpad mode, pointer capture &amp; sensitivity</string>
     <string name="cat_connection_subtitle">Socket, root, mic, camera &amp; audio latency</string>
@@ -44,9 +44,11 @@
     <string name="scancode_unknown">Scan code %1$d</string>
 
     <!-- Immersive mode -->
-    <string name="section_immersive">Immersive Mode (Experimental)</string>
-    <string name="immersive_switch">Enable Immersive Mode (Experimental)</string>
+    <string name="section_immersive">Immersive Mode</string>
+    <string name="immersive_switch">Enable Immersive Mode</string>
     <string name="immersive_hint">Sends touch, keyboard and mouse input directly to the Linux desktop, keeping Android gestures out of the way. Requires root. Set a toggle key below: press it once to enter and again to exit. The mode also ends when you switch apps.</string>
+    <string name="immersive_oplus_refresh_rate_switch">Keep OnePlus refresh rate fixed</string>
+    <string name="immersive_oplus_refresh_rate_hint">Prevents refresh-rate drops on some OnePlus devices when input events are not received.</string>
     <string name="bind_immersive_key_button">Bind Immersive Mode Key</string>
     <string name="immersive_entering">Immersive mode: all input goes to the desktop. Press %1$s again to leave.</string>
     <string name="immersive_exited">Immersive mode off</string>
@@ -54,6 +56,56 @@
     <string name="immersive_failed">Could not start immersive mode: root was denied or is unavailable</string>
     <string name="immersive_no_devices">Could not start immersive mode: no input device could be taken over</string>
     <string name="immersive_interrupted">Immersive mode ended; input returned to Android</string>
+    <string name="immersive_entering_mode">Immersive mode on: %1$s</string>
+
+    <string name="immersive_gold_unknown">Could not check which devices Gold holds; starting without keeping any of them free</string>
+    <string name="immersive_selection_invalid">The saved device selection is not valid; fix it in Immersive input settings</string>
+    <string name="immersive_selection_filtered">Every selected device is held by Gold, so there is nothing left to take</string>
+
+    <!-- Immersive input sources -->
+    <string name="cat_immersive_title">Immersive Mode</string>
+    <string name="cat_immersive_subtitle">Full-screen input control, the toggle key and the input source</string>
+    <string name="immersive_inputs_title">Immersive input</string>
+    <string name="immersive_inputs_subtitle">Choose where immersive mode takes its input from</string>
+    <string name="section_immersive_inputs_source">Input source</string>
+    <string name="section_immersive_inputs_direct">Event nodes to take</string>
+    <string name="section_immersive_inputs_scope">What this covers</string>
+
+    <string name="immersive_inputs_direct_blurb">Currently: Anland takes the physical event nodes itself, and Android cannot see them while it does. Requires root.</string>
+    <string name="immersive_inputs_bus_hint">Gold remaps the keyboard; Anland takes its output exclusively and sends it directly to the desktop.</string>
+    <string name="immersive_inputs_combined_hint">Anland takes touch and pointers together with Gold\'s remapped keyboard output.</string>
+    <string name="immersive_inputs_bus_scope">Requires root and the Gold Keyboard Remaps module. All remapped keyboard keys, including Meta and system shortcuts, go to the desktop during the session. Touch, mouse and Android gestures stay available. Leaving the app or locking the screen releases the keyboard.</string>
+    <string name="immersive_inputs_direct_hint">Only the devices ticked below are taken. Devices Gold has confirmed it holds are shown but cannot be selected.</string>
+    <string name="immersive_inputs_auto">Choose devices automatically</string>
+    <string-array name="immersive_source_options">
+        <item>Anland takes the devices (direct)</item>
+        <item>Gold keyboard directly to desktop</item>
+        <item>Direct touch and pointers + Gold keyboard</item>
+    </string-array>
+    <string name="immersive_source_unavailable">Requires the Gold Keyboard Remaps module, which is not installed or not running</string>
+    <string name="immersive_auto_enter">Automatically enter immersive mode</string>
+    <string name="immersive_auto_enter_hint">Automatically send the Gold keyboard to the desktop when this app returns to the foreground. Touch and Android gestures stay available.</string>
+    <string name="immersive_inputs_loading">Checking devices…</string>
+    <string name="immersive_inputs_found">Gold’s occupied devices are shown but cannot be selected.</string>
+    <string name="immersive_inputs_unknown">Could not check which devices Gold holds, so none are marked as taken. Nothing here is known to be free.</string>
+    <string name="immersive_inputs_occupied">✕ %1$s — held by Gold</string>
+    <string name="immersive_inputs_system_power">✕ %1$s — kept with Android to preserve power button control</string>
+    <string name="device_class_keyboard">Keyboard</string>
+    <string name="device_class_keys">Button node</string>
+    <string name="device_class_mouse">Mouse</string>
+    <string name="device_class_touchpad">Touchpad</string>
+    <string name="device_class_touchscreen">Touchscreen</string>
+    <string name="bus_usb">USB</string>
+    <string name="bus_bluetooth">Bluetooth</string>
+    <string name="bus_builtin">Built-in</string>
+    <string name="bus_virtual">Virtual</string>
+    <string name="bus_i2c">I2C</string>
+    <string name="bus_spi">SPI</string>
+    <string name="bus_other">Bus %1$s</string>
+    <string name="immersive_inputs_remembered">Saved: %1$s. Usable now: %2$s.</string>
+    <string name="immersive_inputs_all_filtered">Every device you saved is held by Gold. Immersive mode will not start until that changes; your selection has been left as it is.</string>
+    <string name="immersive_inputs_none">No input devices were found.</string>
+    <string name="immersive_inputs_unavailable">Could not list input devices: root was denied or is unavailable.</string>
 
     <!-- Accessibility -->
     <string name="accessibility_switch">Accessibility Key Interception</string>
